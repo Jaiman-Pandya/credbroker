@@ -1,0 +1,45 @@
+syntax = "proto3";
+
+package credbroker.v1;
+
+import "google/protobuf/struct.proto";
+import "google/protobuf/timestamp.proto";
+
+// Agent-facing broker API. Agents hold grant tokens, never raw credentials.
+service CredBroker {
+  rpc RequestGrant(GrantRequest) returns (GrantResponse);
+  rpc InvokeTool(InvokeRequest) returns (InvokeResponse);
+  rpc RevokeGrant(RevokeRequest) returns (RevokeResponse);
+}
+
+message GrantRequest {
+  string agent_id = 1;
+  string tool_name = 2;
+  string requested_scope = 3;
+}
+
+message GrantResponse {
+  string grant_token = 1;
+  google.protobuf.Timestamp expires_at = 2;
+  string grant_id = 3;
+}
+
+message InvokeRequest {
+  string grant_token = 1;
+  string tool_name = 2;
+  google.protobuf.Struct arguments = 3;
+  string idempotency_key = 4;
+}
+
+message InvokeResponse {
+  google.protobuf.Struct result = 1;
+  string status = 2;
+}
+
+message RevokeRequest {
+  string grant_id = 1;
+}
+
+message RevokeResponse {
+  bool revoked = 1;
+}
