@@ -1,7 +1,9 @@
 """Grant issuance and revocation.
 
-``request_grant`` is the policy chokepoint: agent policy, scope match, and
-account resolution all run here.
+``request_grant`` is the policy chokepoint: agent policy, scope match,
+account resolution, and the active-grant concurrency limit all run here
+under a row lock on the agent (``SELECT ... FOR UPDATE``; a no-op on SQLite,
+serializing on PostgreSQL) so concurrent requests cannot race past the limit.
 
 No raw provider credential is touched anywhere in this module: the grant
 binds to a ConnectedAccount row by id only, and only the SHA-256 hash of the
@@ -12,12 +14,13 @@ import uuid
 from dataclasses import dataclass
 from datetime import timedelta
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from credbroker.config import Settings
 from credbroker.db.models import AgentIdentity, ConnectedAccount, Grant, utcnow
 from credbroker.errors import (
+    ConcurrencyLimitError,
     GrantNotFoundError,
     GrantScopeMismatchError,
     NoConnectedAccountError,
@@ -53,8 +56,12 @@ async def request_grant(
         GrantScopeMismatchError: ``requested_scope`` != the tool's scope.
         NoConnectedAccountError: the agent's user has no connected account for
             the tool's provider.
+        ConcurrencyLimitError: the agent already holds the maximum number of
+            active grants for this tool + scope.
     """
-    agent = await session.get(AgentIdentity, agent_id)
+    # Row lock on the agent serializes concurrent requests for the same agent
+    # (on PostgreSQL) so the concurrency count below cannot be raced.
+    agent = await session.get(AgentIdentity, agent_id, with_for_update=True)
     if agent is None:
         raise UnknownAgentError(f"unknown agent: {agent_id}")
 
@@ -85,6 +92,24 @@ async def request_grant(
         )
 
     now = utcnow()
+    active_count = (
+        await session.execute(
+            select(func.count())
+            .select_from(Grant)
+            .where(
+                Grant.agent_id == agent_id,
+                Grant.tool_name == tool_name,
+                Grant.scope == requested_scope,
+                Grant.revoked_at.is_(None),
+                Grant.expires_at > now,
+            )
+        )
+    ).scalar_one()
+    if active_count >= settings.max_active_grants_per_agent_scope:
+        raise ConcurrencyLimitError(
+            f"agent already holds {active_count} active grant(s) for {tool_name!r}"
+        )
+
     grant_id = uuid.uuid4()
     expires_at = now + timedelta(seconds=settings.grant_token_ttl_seconds)
     token = sign_grant_token(
