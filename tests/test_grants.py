@@ -4,10 +4,11 @@ import uuid
 from datetime import timedelta
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import select, update
 
 from credbroker.db.models import AgentIdentity, ConnectedAccount, Grant, utcnow
 from credbroker.errors import (
+    ConcurrencyLimitError,
     GrantNotFoundError,
     GrantScopeMismatchError,
     NoConnectedAccountError,
@@ -182,6 +183,71 @@ async def test_grant_never_binds_to_another_users_account(session, settings, age
             tool_name="drive.read",
             requested_scope="read",
         )
+
+
+async def test_concurrency_limit_blocks_second_active_grant(session, settings, agent, account):
+    assert settings.max_active_grants_per_agent_scope == 1
+    await request_grant(
+        session=session,
+        settings=settings,
+        agent_id=agent.id,
+        tool_name="drive.read",
+        requested_scope="read",
+    )
+
+    with pytest.raises(ConcurrencyLimitError):
+        await request_grant(
+            session=session,
+            settings=settings,
+            agent_id=agent.id,
+            tool_name="drive.read",
+            requested_scope="read",
+        )
+
+
+async def test_expired_grant_does_not_count_toward_limit(session, settings, agent, account):
+    first = await request_grant(
+        session=session,
+        settings=settings,
+        agent_id=agent.id,
+        tool_name="drive.read",
+        requested_scope="read",
+    )
+    await session.execute(
+        update(Grant)
+        .where(Grant.id == first.grant.id)
+        .values(expires_at=utcnow() - timedelta(seconds=1))
+    )
+    await session.commit()
+
+    second = await request_grant(
+        session=session,
+        settings=settings,
+        agent_id=agent.id,
+        tool_name="drive.read",
+        requested_scope="read",
+    )
+    assert second.grant.id != first.grant.id
+
+
+async def test_revoked_grant_does_not_count_toward_limit(session, settings, agent, account):
+    first = await request_grant(
+        session=session,
+        settings=settings,
+        agent_id=agent.id,
+        tool_name="drive.read",
+        requested_scope="read",
+    )
+    await revoke_grant(session=session, grant_id=first.grant.id)
+
+    second = await request_grant(
+        session=session,
+        settings=settings,
+        agent_id=agent.id,
+        tool_name="drive.read",
+        requested_scope="read",
+    )
+    assert second.grant.id != first.grant.id
 
 
 async def test_revoke_sets_revoked_at(session, settings, agent, account):
