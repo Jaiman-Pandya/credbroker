@@ -1,7 +1,9 @@
-"""Tests for the invoke path (credbroker.invoke.service).
+"""Tests for the invoke path (credbroker.invoke.service / audit).
 
 Everything runs against SQLite and an httpx.MockTransport that plays both
-the Google Drive API and the OAuth token endpoint — no network.
+the Google Drive API and the OAuth token endpoint — no network. Each test
+asserts the audit trail alongside the outcome, since one audit row per
+resolved invocation is part of the invoke contract.
 """
 
 import logging
@@ -10,18 +12,20 @@ from datetime import timedelta
 
 import httpx
 import pytest
-from sqlalchemy import update
+from sqlalchemy import select, update
 
 from credbroker.crypto.kms import build_token_cipher
 from credbroker.db.models import (
     AgentIdentity,
     ConnectedAccount,
     Grant,
+    ToolCallAuditLog,
     ensure_aware,
     utcnow,
 )
 from credbroker.grants.service import request_grant, revoke_grant
 from credbroker.grants.tokens import sign_grant_token
+from credbroker.invoke.audit import hash_arguments
 from credbroker.invoke.service import InvokeService
 from credbroker.logging_config import clear_registry
 
@@ -144,6 +148,10 @@ async def issue_grant(session, settings, agent):
     )
 
 
+async def audit_rows(session) -> list[ToolCallAuditLog]:
+    return list((await session.execute(select(ToolCallAuditLog))).scalars().all())
+
+
 async def test_happy_path_success(session, settings, service, fake_google, agent, account):
     issued = await issue_grant(session, settings, agent)
 
@@ -161,12 +169,20 @@ async def test_happy_path_success(session, settings, service, fake_google, agent
         fake_google.drive_requests[0].headers["authorization"] == f"Bearer {ACCESS_TOKEN}"
     )
 
+    rows = await audit_rows(session)
+    assert len(rows) == 1
+    assert rows[0].grant_id == issued.grant.id
+    assert rows[0].tool_name == "drive.read"
+    assert rows[0].status == "success"
+    assert rows[0].arguments_hash == hash_arguments(ARGUMENTS)
+    assert rows[0].latency_ms == outcome.latency_ms
 
-async def test_expired_grant_token_denied(
+
+async def test_expired_grant_token_denied_without_audit(
     session, settings, service, fake_google, agent, account
 ):
     # Token-level expiry: the JWT itself has lapsed, so no grant row is
-    # ever resolved.
+    # resolved and no audit row can be attributed.
     token = sign_grant_token(
         settings=settings,
         grant_id=uuid.uuid4(),
@@ -183,9 +199,10 @@ async def test_expired_grant_token_denied(
     assert "expired" in outcome.error
     assert outcome.denied_reason == "expired"
     assert fake_google.drive_requests == []
+    assert await audit_rows(session) == []
 
 
-async def test_expired_grant_row_denied(
+async def test_expired_grant_row_denied_and_audited(
     session, settings, service, fake_google, agent, account
 ):
     # DB-level expiry: the token still verifies but the row (source of
@@ -204,9 +221,12 @@ async def test_expired_grant_row_denied(
     assert "expired" in outcome.error
     assert outcome.denied_reason == "expired"
     assert fake_google.drive_requests == []
+    rows = await audit_rows(session)
+    assert [r.status for r in rows] == ["denied"]
+    assert rows[0].grant_id == issued.grant.id
 
 
-async def test_revoked_grant_denied(
+async def test_revoked_grant_denied_and_audited(
     session, settings, service, fake_google, agent, account
 ):
     issued = await issue_grant(session, settings, agent)
@@ -218,9 +238,11 @@ async def test_revoked_grant_denied(
     assert "revoked" in outcome.error
     assert outcome.denied_reason == "revoked"
     assert fake_google.drive_requests == []
+    rows = await audit_rows(session)
+    assert [r.status for r in rows] == ["denied"]
 
 
-async def test_tool_name_mismatch_denied(
+async def test_tool_name_mismatch_denied_without_audit(
     session, settings, service, fake_google, agent, account
 ):
     issued = await issue_grant(session, settings, agent)
@@ -233,9 +255,10 @@ async def test_tool_name_mismatch_denied(
     assert "not valid for this tool" in outcome.error
     assert outcome.denied_reason == "tool_mismatch"
     assert fake_google.drive_requests == []
+    assert await audit_rows(session) == []
 
 
-async def test_grant_scope_tampering_denied(
+async def test_grant_scope_tampering_denied_and_audited(
     session, settings, service, fake_google, agent, account
 ):
     issued = await issue_grant(session, settings, agent)
@@ -250,9 +273,11 @@ async def test_grant_scope_tampering_denied(
     assert "scope" in outcome.error
     assert outcome.denied_reason == "scope_mismatch"
     assert fake_google.drive_requests == []
+    rows = await audit_rows(session)
+    assert [r.status for r in rows] == ["denied"]
 
 
-async def test_valid_signature_but_unknown_grant_denied(
+async def test_valid_signature_but_unknown_grant_denied_without_audit(
     session, settings, service, fake_google, agent, account
 ):
     token = sign_grant_token(
@@ -271,6 +296,7 @@ async def test_valid_signature_but_unknown_grant_denied(
     assert "not found" in outcome.error
     assert outcome.denied_reason == "not_found"
     assert fake_google.drive_requests == []
+    assert await audit_rows(session) == []
 
 
 async def test_provider_500_reported_as_failed(
@@ -285,6 +311,8 @@ async def test_provider_500_reported_as_failed(
     assert "500" in outcome.error
     assert outcome.result is None
     assert len(fake_google.drive_requests) == 1
+    rows = await audit_rows(session)
+    assert [r.status for r in rows] == ["failed"]
 
 
 async def test_provider_4xx_reported_as_failed(
@@ -298,6 +326,8 @@ async def test_provider_4xx_reported_as_failed(
     assert outcome.status == "failed"
     assert "403" in outcome.error
     assert len(fake_google.drive_requests) == 1
+    rows = await audit_rows(session)
+    assert [r.status for r in rows] == ["failed"]
 
 
 async def test_refresh_path_when_account_expired(
@@ -321,6 +351,8 @@ async def test_refresh_path_when_account_expired(
     # Google omitted refresh_token from the refresh response: keep the old one.
     assert cipher.decrypt(account.encrypted_refresh_token) == REFRESH_TOKEN
     assert ensure_aware(account.expires_at) > utcnow()
+    rows = await audit_rows(session)
+    assert [r.status for r in rows] == ["success"]
 
 
 async def test_expired_account_without_refresh_token_fails(
@@ -344,9 +376,11 @@ async def test_expired_account_without_refresh_token_fails(
     assert "cannot be refreshed" in outcome.error
     assert fake_google.drive_requests == []
     assert fake_google.token_requests == []
+    rows = await audit_rows(session)
+    assert [r.status for r in rows] == ["failed"]
 
 
-async def test_garbage_token_denied(session, settings, service, fake_google):
+async def test_garbage_token_denied_without_audit(session, settings, service, fake_google):
     outcome = await service.invoke(
         grant_token="not-a-jwt", tool_name="drive.read", arguments={}
     )
@@ -355,9 +389,10 @@ async def test_garbage_token_denied(session, settings, service, fake_google):
     assert "invalid" in outcome.error
     assert outcome.denied_reason == "invalid_token"
     assert fake_google.drive_requests == []
+    assert await audit_rows(session) == []
 
 
-async def test_transport_error_during_refresh_failed_without_raw_text(
+async def test_transport_error_during_refresh_failed_audited_without_raw_text(
     session, settings, service, fake_google, agent, account
 ):
     account.expires_at = utcnow() - timedelta(minutes=5)
@@ -375,6 +410,8 @@ async def test_transport_error_during_refresh_failed_without_raw_text(
     assert "boom" not in outcome.error
     assert "oauth2.googleapis.com" not in outcome.error
     assert fake_google.drive_requests == []
+    rows = await audit_rows(session)
+    assert [r.status for r in rows] == ["failed"]
 
 
 async def test_provider_401_triggers_one_refresh_and_retry(
@@ -398,6 +435,8 @@ async def test_provider_401_triggers_one_refresh_and_retry(
     # The rotated credential was persisted, not just used once.
     await session.refresh(account)
     assert cipher.decrypt(account.encrypted_access_token) == REFRESHED_ACCESS_TOKEN
+    rows = await audit_rows(session)
+    assert [r.status for r in rows] == ["success"]
 
 
 async def test_provider_401_after_refresh_fails_without_looping(
@@ -413,6 +452,8 @@ async def test_provider_401_after_refresh_fails_without_looping(
     # Exactly one refresh and one retry: no refresh loop.
     assert len(fake_google.token_requests) == 1
     assert len(fake_google.drive_requests) == 2
+    rows = await audit_rows(session)
+    assert [r.status for r in rows] == ["failed"]
 
 
 async def test_account_expiring_within_margin_is_refreshed_proactively(
@@ -456,7 +497,7 @@ async def test_account_within_margin_but_unrefreshable_still_uses_stored_token(
     assert fake_google.drive_requests[0].headers["authorization"] == f"Bearer {ACCESS_TOKEN}"
 
 
-async def test_unexpected_exception_reported_with_generic_error(
+async def test_unexpected_exception_is_audited_with_generic_error(
     session, settings, service, fake_google, agent, account, caplog
 ):
     issued = await issue_grant(session, settings, agent)
@@ -469,6 +510,8 @@ async def test_unexpected_exception_reported_with_generic_error(
 
     assert outcome.status == "failed"
     assert outcome.error == "internal error during tool invocation"
+    rows = await audit_rows(session)
+    assert [r.status for r in rows] == ["failed"]
     # Server-side, the log names the exception type but scrubs the secret.
     assert "RuntimeError" in caplog.text
     assert ACCESS_TOKEN not in caplog.text
