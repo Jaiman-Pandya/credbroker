@@ -15,13 +15,13 @@ token and a real provider API call, in a fixed order:
 7.  The outbound provider call, plus at most one credential refresh and
     retry when the provider rejects a token that looked fresh with a 401.
 
-Denied and failed calls never raise: every resolvable condition becomes an
-:class:`InvokeOutcome` carrying a scrubbed, credential-free error message.
-Outcomes reached before a grant row could be resolved (bad token, tool
-mismatch, unknown token hash) are logged as warnings only. An unexpected
+Every outcome that resolved a real grant row — success, failed, or denied —
+writes exactly one audit row. Outcomes reached before a grant row could be
+resolved (bad token, tool mismatch, unknown token hash) are logged as
+warnings only, since there is no grant to attribute them to. An unexpected
 exception after grant resolution never escapes: it is logged server-side
-(type name plus scrubbed message) and reported to the agent as a generic
-failure — gRPC would otherwise ship ``str(exc)`` to the agent.
+(type name plus scrubbed message), audited, and reported to the agent as a
+generic failure — gRPC would otherwise ship ``str(exc)`` to the agent.
 """
 
 import asyncio
@@ -46,6 +46,7 @@ from credbroker.errors import (
     UnknownToolError,
 )
 from credbroker.grants.tokens import hash_token, verify_grant_token
+from credbroker.invoke.audit import record_call
 from credbroker.logging_config import scrub
 from credbroker.oauth import google
 from credbroker.tools import get_tool
@@ -120,14 +121,15 @@ class InvokeService:
         """Run one tool invocation under a grant token.
 
         Never raises for a deniable or failed call — every resolvable
-        condition becomes an :class:`InvokeOutcome`. Even an unexpected
-        exception after grant resolution is converted to a generic failure
-        rather than propagating toward the agent.
+        condition becomes an :class:`InvokeOutcome` (and, once a grant row
+        has been resolved, an audit row). Even an unexpected exception after
+        grant resolution is converted to a generic, audited failure rather
+        than propagating toward the agent.
         """
         start = time.monotonic()
 
         # Step 1: offline token verification. No grant row is resolvable on
-        # failure, so log a warning instead.
+        # failure, so log a warning instead of writing an audit row.
         try:
             claims = verify_grant_token(grant_token, self._settings)
         except GrantExpiredError as exc:
@@ -161,7 +163,7 @@ class InvokeService:
             ).scalar_one_or_none()
             if grant is None:
                 # Verified signature but no row: a foreign-environment token
-                # or a lost row.
+                # or a lost row. Nothing to audit against.
                 logger.warning(
                     "invoke denied: no grant row for presented token (jti=%s)", claims.grant_id
                 )
@@ -180,10 +182,11 @@ class InvokeService:
                     start=start,
                 )
             except Exception as exc:
-                # Final backstop: only a generic message may travel toward
-                # the agent (grpc.aio forwards str(exc) verbatim). Server-side,
-                # log the type name plus a scrubbed message — never a traceback
-                # line that could embed credential material past the filter.
+                # Final backstop: an unexpected error must still be audited,
+                # and only a generic message may travel toward the agent
+                # (grpc.aio forwards str(exc) verbatim). Server-side, log the
+                # type name plus a scrubbed message — never a traceback line
+                # that could embed credential material past the filter.
                 logger.error(
                     "unexpected error invoking %s under grant %s: %s: %s",
                     tool_name,
@@ -191,12 +194,22 @@ class InvokeService:
                     type(exc).__name__,
                     scrub(str(exc)),
                 )
-                # The session may hold a broken transaction; clear it before
-                # the session closes.
+                # The session may hold a broken transaction; clear it so the
+                # audit write below can still commit.
                 await session.rollback()
                 outcome = self._outcome(
                     "failed", error="internal error during tool invocation", start=start
                 )
+
+            # Step 8: exactly one audit row per outcome with a resolved grant.
+            await record_call(
+                session,
+                grant_id=grant_id,
+                tool_name=tool_name,
+                arguments=arguments,
+                status=outcome.status,
+                latency_ms=outcome.latency_ms,
+            )
         return outcome
 
     async def _invoke_resolved(
@@ -208,7 +221,7 @@ class InvokeService:
         arguments: dict,
         start: float,
     ) -> InvokeOutcome:
-        """Steps 3 through 7, once a grant row has been resolved."""
+        """Steps 3 through 7, once a grant row exists to audit against."""
         # Step 3: revocation and grant expiry, straight from the grant row.
         if grant.revoked_at is not None:
             return self._outcome(
