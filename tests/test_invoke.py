@@ -1,9 +1,9 @@
 """Tests for the invoke path (credbroker.invoke.service / audit).
 
-Everything runs against SQLite and an httpx.MockTransport that plays both
-the Google Drive API and the OAuth token endpoint — no network. Each test
-asserts the audit trail alongside the outcome, since one audit row per
-resolved invocation is part of the invoke contract.
+Everything runs against SQLite, fakeredis, and an httpx.MockTransport that
+plays both the Google Drive API and the OAuth token endpoint — no network.
+Each test asserts the audit trail alongside the outcome, since one audit row
+per resolved invocation is part of the invoke contract.
 """
 
 import logging
@@ -28,6 +28,7 @@ from credbroker.grants.tokens import sign_grant_token
 from credbroker.invoke.audit import hash_arguments
 from credbroker.invoke.service import InvokeService
 from credbroker.logging_config import clear_registry
+from credbroker.reliability.idempotency import IdempotencyStore
 
 ACCESS_TOKEN = "raw-google-access-token-0123456789abcdef"
 # One user owns both the agent and the connected account in these tests.
@@ -106,11 +107,17 @@ async def http_client(fake_google):
 
 
 @pytest.fixture
-def service(settings, session_factory, cipher, http_client):
+def idempotency_store(redis_client, settings):
+    return IdempotencyStore(redis_client, settings.idempotency_window_seconds)
+
+
+@pytest.fixture
+def service(settings, session_factory, cipher, idempotency_store, http_client):
     return InvokeService(
         settings=settings,
         session_factory=session_factory,
         cipher=cipher,
+        idempotency_store=idempotency_store,
         http_client=http_client,
     )
 
@@ -163,6 +170,7 @@ async def test_happy_path_success(session, settings, service, fake_google, agent
     assert outcome.result == DRIVE_RESULT
     assert outcome.error is None
     assert outcome.denied_reason is None
+    assert outcome.from_cache is False
     assert isinstance(outcome.latency_ms, int) and outcome.latency_ms >= 0
     assert len(fake_google.drive_requests) == 1
     assert (
@@ -330,6 +338,83 @@ async def test_provider_4xx_reported_as_failed(
     assert [r.status for r in rows] == ["failed"]
 
 
+async def test_idempotent_replay_serves_cache_without_provider_call(
+    session, settings, service, fake_google, agent, account
+):
+    issued = await issue_grant(session, settings, agent)
+
+    first = await service.invoke(
+        grant_token=issued.token,
+        tool_name="drive.read",
+        arguments=ARGUMENTS,
+        idempotency_key="job-42",
+    )
+    second = await service.invoke(
+        grant_token=issued.token,
+        tool_name="drive.read",
+        arguments=ARGUMENTS,
+        idempotency_key="job-42",
+    )
+
+    assert first.status == "success" and first.from_cache is False
+    assert second.status == "success" and second.from_cache is True
+    assert second.result == DRIVE_RESULT
+    # The provider was hit exactly once; the replay came from the cache.
+    assert len(fake_google.drive_requests) == 1
+    rows = await audit_rows(session)
+    assert sorted(r.status for r in rows) == ["success", "success"]
+
+
+async def test_idempotency_conflict_denied(
+    session, settings, service, idempotency_store, fake_google, agent, account
+):
+    issued = await issue_grant(session, settings, agent)
+    # Another invocation holds the reservation mid-flight.
+    assert await idempotency_store.reserve(f"{agent.id}:{account.id}:drive.read:job-7")
+
+    outcome = await service.invoke(
+        grant_token=issued.token,
+        tool_name="drive.read",
+        arguments={},
+        idempotency_key="job-7",
+    )
+
+    assert outcome.status == "denied"
+    assert "idempotency key" in outcome.error
+    assert outcome.denied_reason == "idempotency_conflict"
+    assert fake_google.drive_requests == []
+    rows = await audit_rows(session)
+    assert [r.status for r in rows] == ["denied"]
+
+
+async def test_failed_call_releases_idempotency_reservation(
+    session, settings, service, fake_google, agent, account
+):
+    issued = await issue_grant(session, settings, agent)
+    fake_google.drive_status = 500
+
+    failed = await service.invoke(
+        grant_token=issued.token,
+        tool_name="drive.read",
+        arguments={},
+        idempotency_key="job-9",
+    )
+    assert failed.status == "failed"
+
+    fake_google.drive_status = 200
+    retried = await service.invoke(
+        grant_token=issued.token,
+        tool_name="drive.read",
+        arguments={},
+        idempotency_key="job-9",
+    )
+
+    # The failed attempt must not wedge the key: the retry reaches the provider.
+    assert retried.status == "success"
+    assert retried.from_cache is False
+    assert len(fake_google.drive_requests) == 2
+
+
 async def test_refresh_path_when_account_expired(
     session, settings, service, cipher, fake_google, agent, account
 ):
@@ -412,6 +497,52 @@ async def test_transport_error_during_refresh_failed_audited_without_raw_text(
     assert fake_google.drive_requests == []
     rows = await audit_rows(session)
     assert [r.status for r in rows] == ["failed"]
+
+
+async def test_idempotency_key_is_isolated_per_connected_account(
+    session, settings, service, cipher, idempotency_store, fake_google, agent, account
+):
+    issued_a = await issue_grant(session, settings, agent)
+    first = await service.invoke(
+        grant_token=issued_a.token,
+        tool_name="drive.read",
+        arguments=ARGUMENTS,
+        idempotency_key="job-77",
+    )
+    assert first.status == "success" and first.from_cache is False
+    # The cache key is bound to the connected account, not just the agent.
+    cached = await idempotency_store.get(f"{agent.id}:{account.id}:drive.read:job-77")
+    assert cached == DRIVE_RESULT
+
+    account_b = ConnectedAccount(
+        user_id=USER_ID,
+        provider="google",
+        encrypted_access_token=cipher.encrypt(ACCESS_TOKEN),
+        encrypted_refresh_token=cipher.encrypt(REFRESH_TOKEN),
+        scopes_granted=["https://www.googleapis.com/auth/drive.readonly"],
+        expires_at=utcnow() + timedelta(hours=1),
+        # Strictly newest so grant issuance binds to this account.
+        created_at=utcnow() + timedelta(seconds=5),
+    )
+    session.add(account_b)
+    await session.commit()
+    # Free the agent's active-grant slot; the idempotency cache entry is
+    # keyed by agent + account, not by grant, so it survives the revocation.
+    await revoke_grant(session=session, grant_id=issued_a.grant.id)
+    issued_b = await issue_grant(session, settings, agent)
+    assert issued_b.grant.connected_account_id == account_b.id
+
+    second = await service.invoke(
+        grant_token=issued_b.token,
+        tool_name="drive.read",
+        arguments=ARGUMENTS,
+        idempotency_key="job-77",
+    )
+
+    # Same agent, same key, different account: the result cached against
+    # account A must not be replayed — the provider is called again.
+    assert second.status == "success" and second.from_cache is False
+    assert len(fake_google.drive_requests) == 2
 
 
 async def test_provider_401_triggers_one_refresh_and_retry(

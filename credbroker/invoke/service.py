@@ -8,11 +8,13 @@ token and a real provider API call, in a fixed order:
 2.  The requested tool must match the tool the token was issued for.
 3.  Revocation and expiry, read from the grant row in the database.
 4.  Tool resolution and grant-scope / tool-scope agreement.
-5.  Connected-account freshness (refreshing the provider access token when
+5.  Idempotency: replay a cached result without touching the provider, or
+    reserve the key for this call.
+6.  Connected-account freshness (refreshing the provider access token when
     it has expired — or is about to — and a refresh token is stored).
-6.  Decryption of the access token, kept in the narrowest possible scope —
+7.  Decryption of the access token, kept in the narrowest possible scope —
     never stored on the service, never logged, never put in an exception.
-7.  The outbound provider call, plus at most one credential refresh and
+8.  The outbound provider call, plus at most one credential refresh and
     retry when the provider rejects a token that looked fresh with a 401.
 
 Every outcome that resolved a real grant row — success, failed, or denied —
@@ -41,6 +43,7 @@ from credbroker.db.models import ConnectedAccount, Grant, ensure_aware, utcnow
 from credbroker.errors import (
     GrantExpiredError,
     GrantTokenInvalidError,
+    IdempotencyConflictError,
     OAuthFlowError,
     ProviderCallError,
     UnknownToolError,
@@ -49,6 +52,7 @@ from credbroker.grants.tokens import hash_token, verify_grant_token
 from credbroker.invoke.audit import record_call
 from credbroker.logging_config import scrub
 from credbroker.oauth import google
+from credbroker.reliability.idempotency import IdempotencyStore
 from credbroker.tools import get_tool
 
 logger = logging.getLogger(__name__)
@@ -67,13 +71,15 @@ class InvokeOutcome:
     success); ``result`` is the provider's JSON-safe payload on success.
     ``denied_reason`` is a machine-readable code set on every denied outcome
     — one of ``invalid_token``, ``expired``, ``revoked``, ``not_found``,
-    ``tool_mismatch``, ``scope_mismatch`` — and None otherwise.
+    ``tool_mismatch``, ``scope_mismatch``, ``idempotency_conflict`` — and
+    None otherwise.
     """
 
     status: str  # "success" | "failed" | "denied"
     result: dict | None
     error: str | None  # safe message, scrubbed; None on success
     latency_ms: int
+    from_cache: bool = False  # served from idempotency cache
     denied_reason: str | None = None
 
 
@@ -84,10 +90,14 @@ def _elapsed_ms(start: float) -> int:
 class InvokeService:
     """Executes tool calls under grant tokens; the sole holder of decrypted credentials.
 
-    All collaborators are injected. ``http_client`` is optional: when
-    omitted, the service lazily creates an ``httpx.AsyncClient`` on first
-    use and owns it — call :meth:`aclose` on shutdown to close an owned
-    client. An injected client always remains the caller's to close.
+    All collaborators are injected. The Redis-backed ``idempotency_store``
+    is optional: without it the dedup step is skipped, but every
+    database-backed security check still runs.
+
+    ``http_client`` is likewise optional: when omitted, the service lazily
+    creates an ``httpx.AsyncClient`` on first use and owns it — call
+    :meth:`aclose` on shutdown to close an owned client. An injected client
+    always remains the caller's to close.
     """
 
     def __init__(
@@ -96,11 +106,13 @@ class InvokeService:
         settings: Settings,
         session_factory,
         cipher: TokenCipher,
+        idempotency_store: IdempotencyStore | None = None,
         http_client: httpx.AsyncClient | None = None,
     ):
         self._settings = settings
         self._session_factory = session_factory
         self._cipher = cipher
+        self._idempotency_store = idempotency_store
         self._http_client = http_client
         self._owns_http_client = False
 
@@ -117,6 +129,7 @@ class InvokeService:
         grant_token: str,
         tool_name: str,
         arguments: dict,
+        idempotency_key: str | None = None,
     ) -> InvokeOutcome:
         """Run one tool invocation under a grant token.
 
@@ -179,6 +192,7 @@ class InvokeService:
                     grant=grant,
                     tool_name=tool_name,
                     arguments=arguments,
+                    idempotency_key=idempotency_key,
                     start=start,
                 )
             except Exception as exc:
@@ -201,7 +215,7 @@ class InvokeService:
                     "failed", error="internal error during tool invocation", start=start
                 )
 
-            # Step 8: exactly one audit row per outcome with a resolved grant.
+            # Step 9: exactly one audit row per outcome with a resolved grant.
             await record_call(
                 session,
                 grant_id=grant_id,
@@ -219,9 +233,10 @@ class InvokeService:
         grant: Grant,
         tool_name: str,
         arguments: dict,
+        idempotency_key: str | None,
         start: float,
     ) -> InvokeOutcome:
-        """Steps 3 through 7, once a grant row exists to audit against."""
+        """Steps 3 through 8, once a grant row exists to audit against."""
         # Step 3: revocation and grant expiry, straight from the grant row.
         if grant.revoked_at is not None:
             return self._outcome(
@@ -247,13 +262,62 @@ class InvokeService:
                 start=start,
             )
 
-        return await self._execute_call(
-            session=session,
-            grant=grant,
-            tool=tool,
-            arguments=arguments,
-            start=start,
-        )
+        # Step 5: idempotency — replay, conflict, or reservation. The key is
+        # bound to the connected account as well as the agent, so a replay
+        # can never serve a result produced against a different account.
+        full_key: str | None = None
+        reservation: str | None = None
+        if idempotency_key is not None and self._idempotency_store is not None:
+            full_key = (
+                f"{grant.agent_id}:{grant.connected_account_id}:{tool_name}:{idempotency_key}"
+            )
+            try:
+                cached = await self._idempotency_store.get(full_key)
+            except IdempotencyConflictError:
+                return self._outcome(
+                    "denied",
+                    error="concurrent call with same idempotency key",
+                    denied_reason="idempotency_conflict",
+                    start=start,
+                )
+            if cached is not None:
+                return self._outcome("success", result=cached, start=start, from_cache=True)
+            reservation = await self._idempotency_store.reserve(full_key)
+            if reservation is None:
+                # Lost a race between get() and reserve(): someone else now
+                # holds the key. Same conflict, later detection.
+                return self._outcome(
+                    "denied",
+                    error="concurrent call with same idempotency key",
+                    denied_reason="idempotency_conflict",
+                    start=start,
+                )
+
+        try:
+            outcome = await self._execute_call(
+                session=session,
+                grant=grant,
+                tool=tool,
+                arguments=arguments,
+                start=start,
+            )
+        except Exception:
+            # An unexpected error must not wedge the idempotency key for the
+            # full reservation TTL; free it, then let the error surface. The
+            # owner token stops a stale holder (reservation TTL expired
+            # mid-call) from clobbering a successor's reservation or result.
+            if full_key is not None:
+                await self._idempotency_store.release(full_key, owner=reservation)
+            raise
+
+        if full_key is not None:
+            if outcome.status == "success":
+                await self._idempotency_store.complete(
+                    full_key, outcome.result or {}, owner=reservation
+                )
+            else:
+                await self._idempotency_store.release(full_key, owner=reservation)
+        return outcome
 
     async def _execute_call(
         self,
@@ -264,13 +328,13 @@ class InvokeService:
         arguments: dict,
         start: float,
     ) -> InvokeOutcome:
-        """Steps 5-7: account freshness, decryption, and the provider call."""
-        # Step 5: load the backing account and refresh its credential if stale.
+        """Steps 6-8: account freshness, decryption, and the provider call."""
+        # Step 6: load the backing account and refresh its credential if stale.
         account = await session.get(ConnectedAccount, grant.connected_account_id)
         if account is None:
             return self._outcome("failed", error="connected account no longer exists", start=start)
 
-        # Step 6: the decrypted credential lives only in these locals and the
+        # Step 7: the decrypted credential lives only in these locals and the
         # tool-call closure — never on self, never in a log line, never
         # inside an exception message.
         expires_at = ensure_aware(account.expires_at)
@@ -306,7 +370,7 @@ class InvokeService:
                     "failed", error="stored credential could not be decrypted", start=start
                 )
 
-        # Step 7: the provider call. One in-band recovery: a 401 on a
+        # Step 8: the provider call. One in-band recovery: a 401 on a
         # credential this call has not already refreshed triggers a single
         # refresh and retry (the token may have been invalidated
         # provider-side); a second 401 fails.
@@ -425,6 +489,7 @@ class InvokeService:
         error: str | None = None,
         denied_reason: str | None = None,
         start: float,
+        from_cache: bool = False,
     ) -> InvokeOutcome:
         """Build an outcome, scrubbing the error message as belt-and-braces.
 
@@ -438,5 +503,6 @@ class InvokeService:
             result=result,
             error=scrub(error) if error is not None else None,
             latency_ms=_elapsed_ms(start),
+            from_cache=from_cache,
             denied_reason=denied_reason,
         )
