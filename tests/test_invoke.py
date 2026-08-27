@@ -307,7 +307,7 @@ async def test_valid_signature_but_unknown_grant_denied_without_audit(
     assert await audit_rows(session) == []
 
 
-async def test_provider_500_reported_as_failed(
+async def test_provider_500_retried_then_failed(
     session, settings, service, fake_google, agent, account
 ):
     issued = await issue_grant(session, settings, agent)
@@ -318,14 +318,13 @@ async def test_provider_500_reported_as_failed(
     assert outcome.status == "failed"
     assert "500" in outcome.error
     assert outcome.result is None
-    assert len(fake_google.drive_requests) == 1
+    # One initial attempt plus every configured retry.
+    assert len(fake_google.drive_requests) == settings.outbound_max_retries + 1
     rows = await audit_rows(session)
     assert [r.status for r in rows] == ["failed"]
 
 
-async def test_provider_4xx_reported_as_failed(
-    session, settings, service, fake_google, agent, account
-):
+async def test_provider_4xx_not_retried(session, settings, service, fake_google, agent, account):
     issued = await issue_grant(session, settings, agent)
     fake_google.drive_status = 403
 
@@ -412,7 +411,7 @@ async def test_failed_call_releases_idempotency_reservation(
     # The failed attempt must not wedge the key: the retry reaches the provider.
     assert retried.status == "success"
     assert retried.from_cache is False
-    assert len(fake_google.drive_requests) == 2
+    assert len(fake_google.drive_requests) == settings.outbound_max_retries + 1 + 1
 
 
 async def test_refresh_path_when_account_expired(

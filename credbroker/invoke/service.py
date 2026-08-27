@@ -14,8 +14,9 @@ token and a real provider API call, in a fixed order:
     it has expired — or is about to — and a refresh token is stored).
 7.  Decryption of the access token, kept in the narrowest possible scope —
     never stored on the service, never logged, never put in an exception.
-8.  The outbound provider call, plus at most one credential refresh and
-    retry when the provider rejects a token that looked fresh with a 401.
+8.  The outbound provider call, with retries, backoff, and a per-provider
+    circuit breaker — plus at most one credential refresh and retry when the
+    provider rejects a token that looked fresh with a 401.
 
 Every outcome that resolved a real grant row — success, failed, or denied —
 writes exactly one audit row. Outcomes reached before a grant row could be
@@ -46,6 +47,7 @@ from credbroker.errors import (
     IdempotencyConflictError,
     OAuthFlowError,
     ProviderCallError,
+    ProviderUnavailableError,
     UnknownToolError,
 )
 from credbroker.grants.tokens import hash_token, verify_grant_token
@@ -53,6 +55,7 @@ from credbroker.invoke.audit import record_call
 from credbroker.logging_config import scrub
 from credbroker.oauth import google
 from credbroker.reliability.idempotency import IdempotencyStore
+from credbroker.reliability.retry import CircuitBreaker, call_with_retries
 from credbroker.tools import get_tool
 
 logger = logging.getLogger(__name__)
@@ -108,6 +111,7 @@ class InvokeService:
         cipher: TokenCipher,
         idempotency_store: IdempotencyStore | None = None,
         http_client: httpx.AsyncClient | None = None,
+        circuits: dict[str, CircuitBreaker] | None = None,
     ):
         self._settings = settings
         self._session_factory = session_factory
@@ -115,6 +119,9 @@ class InvokeService:
         self._idempotency_store = idempotency_store
         self._http_client = http_client
         self._owns_http_client = False
+        # Shared per-provider breakers; injectable so tests (or a caller
+        # managing several services) can observe or pre-trip them.
+        self._circuits = circuits if circuits is not None else {}
 
     async def aclose(self) -> None:
         """Close the HTTP client if this service created (and thus owns) it."""
@@ -370,10 +377,10 @@ class InvokeService:
                     "failed", error="stored credential could not be decrypted", start=start
                 )
 
-        # Step 8: the provider call. One in-band recovery: a 401 on a
-        # credential this call has not already refreshed triggers a single
-        # refresh and retry (the token may have been invalidated
-        # provider-side); a second 401 fails.
+        # Step 8: the provider call, with retries and the provider's breaker.
+        # One in-band recovery: a 401 on a credential this call has not
+        # already refreshed triggers a single refresh and retry (the token
+        # may have been invalidated provider-side); a second 401 fails.
         while True:
             try:
                 result = await self._call_provider(tool, access_token, arguments)
@@ -386,6 +393,8 @@ class InvokeService:
                     refreshed = True
                     continue
                 # Carries a caller-safe message by construction (status only).
+                return self._outcome("failed", error=str(exc), start=start)
+            except ProviderUnavailableError as exc:
                 return self._outcome("failed", error=str(exc), start=start)
             except httpx.TimeoutException:
                 return self._outcome(
@@ -405,8 +414,13 @@ class InvokeService:
             return self._outcome("success", result=result, start=start)
 
     async def _call_provider(self, tool, access_token: str, arguments: dict) -> dict:
-        """Run one outbound provider call."""
-        return await tool.call(access_token, arguments, self._http())
+        """Run one outbound provider call with retries and the provider's breaker."""
+        return await call_with_retries(
+            lambda: tool.call(access_token, arguments, self._http()),
+            max_retries=self._settings.outbound_max_retries,
+            base_delay=self._settings.outbound_base_delay_seconds,
+            circuit=self._circuit_for(tool.provider),
+        )
 
     async def _refresh_or_outcome(
         self, session: AsyncSession, account: ConnectedAccount, start: float
@@ -480,6 +494,17 @@ class InvokeService:
             self._http_client = httpx.AsyncClient(timeout=15.0)
             self._owns_http_client = True
         return self._http_client
+
+    def _circuit_for(self, provider: str) -> CircuitBreaker:
+        """Return (creating on first use) the shared breaker for one provider."""
+        circuit = self._circuits.get(provider)
+        if circuit is None:
+            circuit = CircuitBreaker(
+                failure_threshold=self._settings.circuit_failure_threshold,
+                reset_seconds=self._settings.circuit_reset_seconds,
+            )
+            self._circuits[provider] = circuit
+        return circuit
 
     def _outcome(
         self,
