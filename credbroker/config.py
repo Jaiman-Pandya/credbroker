@@ -39,8 +39,12 @@ class Settings(BaseSettings):
     jwt_issuer: str = "credbroker"
     max_active_grants_per_agent_scope: int = 1
 
-    # Idempotency
+    # Idempotency / outbound reliability
     idempotency_window_seconds: int = 3600
+    outbound_max_retries: int = 3
+    outbound_base_delay_seconds: float = 0.2
+    circuit_failure_threshold: int = 5
+    circuit_reset_seconds: float = 30.0
 
 
 @lru_cache
