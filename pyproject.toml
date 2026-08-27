@@ -19,6 +19,7 @@ dependencies = [
     "PyJWT[crypto]>=2.8",
     "grpcio>=1.66",
     "protobuf>=5.26",
+    "redis>=5.0",
 ]
 
 [project.optional-dependencies]
@@ -26,6 +27,7 @@ dev = [
     "pytest>=8.2",
     "pytest-asyncio>=0.23",
     "aiosqlite>=0.20",
+    "fakeredis>=2.23",
     "respx>=0.21",
     "grpcio-tools>=1.66",
     "ruff>=0.4",

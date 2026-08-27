@@ -15,6 +15,7 @@ class Settings(BaseSettings):
 
     # Core services
     database_url: str = "postgresql+asyncpg://credbroker:credbroker@localhost:5432/credbroker"
+    redis_url: str = "redis://localhost:6379/0"
     http_host: str = "0.0.0.0"
     http_port: int = 8000
     grpc_port: int = 50051
@@ -37,6 +38,9 @@ class Settings(BaseSettings):
     jwt_public_key_pem: str = ""
     jwt_issuer: str = "credbroker"
     max_active_grants_per_agent_scope: int = 1
+
+    # Idempotency
+    idempotency_window_seconds: int = 3600
 
 
 @lru_cache
