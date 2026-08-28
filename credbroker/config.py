@@ -46,6 +46,10 @@ class Settings(BaseSettings):
     circuit_failure_threshold: int = 5
     circuit_reset_seconds: float = 30.0
 
+    # Rate limiting (fixed one-minute windows, per agent identity)
+    grants_per_minute_per_agent: int = 60
+    invokes_per_minute_per_agent: int = 120
+
 
 @lru_cache
 def get_settings() -> Settings:
