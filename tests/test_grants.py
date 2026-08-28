@@ -1,4 +1,8 @@
-"""Tests for grant issuance and revocation (credbroker.grants.service)."""
+"""Tests for grant issuance and revocation (credbroker.grants.service).
+
+The grant cache and rate limiter collaborators are tiny local fakes that
+match the contract-pinned GrantCache / RateLimiter method signatures.
+"""
 
 import uuid
 from datetime import timedelta
@@ -13,6 +17,7 @@ from credbroker.errors import (
     GrantScopeMismatchError,
     NoConnectedAccountError,
     PolicyDeniedError,
+    RateLimitedError,
     UnknownAgentError,
     UnknownToolError,
 )
@@ -21,6 +26,32 @@ from credbroker.grants.tokens import hash_token, verify_grant_token
 
 # One user owns both the agent and the connected account in these tests.
 USER_ID = uuid.uuid4()
+
+
+class FakeGrantCache:
+    """Records calls; matches the pinned GrantCache method signatures."""
+
+    def __init__(self):
+        self.issued: list[tuple[str, int]] = []
+        self.revoked: list[str] = []
+
+    async def record_issued(self, token_hash: str, ttl_seconds: int) -> None:
+        self.issued.append((token_hash, ttl_seconds))
+
+    async def record_revoked(self, token_hash: str, ttl_seconds: int = 600) -> None:
+        self.revoked.append(token_hash)
+
+
+class FakeRateLimiter:
+    """Records calls and answers with a fixed verdict; matches RateLimiter.check."""
+
+    def __init__(self, allow: bool = True):
+        self.allow = allow
+        self.calls: list[tuple[str, int]] = []
+
+    async def check(self, key: str, limit: int, window_seconds: int = 60) -> bool:
+        self.calls.append((key, limit))
+        return self.allow
 
 
 @pytest.fixture
@@ -47,12 +78,17 @@ async def account(session):
 
 
 async def test_happy_path_issues_verifiable_token(session, settings, agent, account):
+    cache = FakeGrantCache()
+    limiter = FakeRateLimiter(allow=True)
+
     issued = await request_grant(
         session=session,
         settings=settings,
         agent_id=agent.id,
         tool_name="drive.read",
         requested_scope="read",
+        grant_cache=cache,
+        rate_limiter=limiter,
     )
 
     claims = verify_grant_token(issued.token, settings)
@@ -65,6 +101,11 @@ async def test_happy_path_issues_verifiable_token(session, settings, agent, acco
     assert issued.grant.revoked_at is None
     ttl = issued.grant.expires_at - issued.grant.issued_at
     assert ttl == timedelta(seconds=settings.grant_token_ttl_seconds)
+
+    assert limiter.calls == [(f"grants:{agent.id}", settings.grants_per_minute_per_agent)]
+    assert cache.issued == [
+        (hash_token(issued.token), settings.grant_token_ttl_seconds)
+    ]
 
 
 async def test_only_token_hash_is_persisted(session, settings, agent, account):
@@ -250,19 +291,39 @@ async def test_revoked_grant_does_not_count_toward_limit(session, settings, agen
     assert second.grant.id != first.grant.id
 
 
-async def test_revoke_sets_revoked_at(session, settings, agent, account):
+async def test_rate_limited(session, settings, agent, account):
+    limiter = FakeRateLimiter(allow=False)
+
+    with pytest.raises(RateLimitedError):
+        await request_grant(
+            session=session,
+            settings=settings,
+            agent_id=agent.id,
+            tool_name="drive.read",
+            requested_scope="read",
+            rate_limiter=limiter,
+        )
+
+    # Rate limiting runs before any DB work: no grant row must exist.
+    assert (await session.execute(select(Grant))).scalars().all() == []
+
+
+async def test_revoke_sets_revoked_at_and_notifies_cache(session, settings, agent, account):
+    cache = FakeGrantCache()
     issued = await request_grant(
         session=session,
         settings=settings,
         agent_id=agent.id,
         tool_name="drive.read",
         requested_scope="read",
+        grant_cache=cache,
     )
 
-    revoked = await revoke_grant(session=session, grant_id=issued.grant.id)
+    revoked = await revoke_grant(session=session, grant_id=issued.grant.id, grant_cache=cache)
 
     assert revoked.id == issued.grant.id
     assert revoked.revoked_at is not None
+    assert cache.revoked == [hash_token(issued.token)]
 
 
 async def test_revoke_is_idempotent(session, settings, agent, account):

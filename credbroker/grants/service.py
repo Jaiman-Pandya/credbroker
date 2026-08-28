@@ -1,13 +1,17 @@
 """Grant issuance and revocation.
 
-``request_grant`` is the policy chokepoint: agent policy, scope match,
-account resolution, and the active-grant concurrency limit all run here
+``request_grant`` is the policy chokepoint: rate limit, agent policy, scope
+match, account resolution, and the active-grant concurrency limit all run here
 under a row lock on the agent (``SELECT ... FOR UPDATE``; a no-op on SQLite,
 serializing on PostgreSQL) so concurrent requests cannot race past the limit.
 
 No raw provider credential is touched anywhere in this module: the grant
 binds to a ConnectedAccount row by id only, and only the SHA-256 hash of the
 issued token is persisted.
+
+Collaborators are injected: ``grant_cache`` (``record_issued`` /
+``record_revoked``) and ``rate_limiter`` (``check``) are optional so callers
+without Redis — and tests — can pass None or a fake.
 """
 
 import uuid
@@ -25,6 +29,7 @@ from credbroker.errors import (
     GrantScopeMismatchError,
     NoConnectedAccountError,
     PolicyDeniedError,
+    RateLimitedError,
     UnknownAgentError,
 )
 from credbroker.grants.tokens import hash_token, sign_grant_token
@@ -46,10 +51,13 @@ async def request_grant(
     agent_id: uuid.UUID,
     tool_name: str,
     requested_scope: str,
+    grant_cache=None,
+    rate_limiter=None,
 ) -> IssuedGrant:
     """Issue a short-lived signed grant for one agent + tool + scope.
 
     Raises:
+        RateLimitedError: the agent exceeded its grant-request rate limit.
         UnknownAgentError: no such agent identity.
         UnknownToolError: no such tool adapter registered.
         PolicyDeniedError: the tool is not in the agent's ``allowed_scopes``.
@@ -59,6 +67,13 @@ async def request_grant(
         ConcurrencyLimitError: the agent already holds the maximum number of
             active grants for this tool + scope.
     """
+    if rate_limiter is not None:
+        allowed = await rate_limiter.check(
+            f"grants:{agent_id}", settings.grants_per_minute_per_agent
+        )
+        if not allowed:
+            raise RateLimitedError("grant request rate limit exceeded")
+
     # Row lock on the agent serializes concurrent requests for the same agent
     # (on PostgreSQL) so the concurrency count below cannot be raced.
     agent = await session.get(AgentIdentity, agent_id, with_for_update=True)
@@ -135,6 +150,9 @@ async def request_grant(
     session.add(grant)
     await session.commit()
 
+    if grant_cache is not None:
+        await grant_cache.record_issued(token_hash, settings.grant_token_ttl_seconds)
+
     return IssuedGrant(token=token, grant=grant)
 
 
@@ -142,10 +160,13 @@ async def revoke_grant(
     *,
     session: AsyncSession,
     grant_id: uuid.UUID,
+    grant_cache=None,
 ) -> Grant:
     """Revoke a grant immediately. Idempotent: re-revoking is a no-op.
 
-    The database row is the source of truth for revocation.
+    The Redis revocation marker is (re-)written on every call so the fast
+    revocation check in the invoke path converges even if an earlier cache
+    write was lost; the database row remains the source of truth.
 
     Raises:
         GrantNotFoundError: no grant with this id exists.
@@ -154,8 +175,12 @@ async def revoke_grant(
     if grant is None:
         raise GrantNotFoundError(f"grant not found: {grant_id}")
 
+    token_hash = grant.grant_token_hash
     if grant.revoked_at is None:
         grant.revoked_at = utcnow()
         await session.commit()
+
+    if grant_cache is not None:
+        await grant_cache.record_revoked(token_hash)
 
     return grant
