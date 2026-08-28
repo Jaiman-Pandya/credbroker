@@ -14,6 +14,8 @@ import httpx
 import pytest
 from sqlalchemy import select, update
 
+from credbroker.cache.grants_cache import GrantCache
+from credbroker.cache.ratelimit import RateLimiter
 from credbroker.crypto.kms import build_token_cipher
 from credbroker.db.models import (
     AgentIdentity,
@@ -82,6 +84,13 @@ class FakeGoogle:
         return httpx.Response(200, json=DRIVE_RESULT)
 
 
+class DenyAllRateLimiter:
+    """Rate limiter double that always says no; matches RateLimiter.check."""
+
+    async def check(self, key: str, limit: int, window_seconds: int = 60) -> bool:
+        return False
+
+
 @pytest.fixture(autouse=True)
 def _clean_secret_registry():
     clear_registry()
@@ -107,16 +116,30 @@ async def http_client(fake_google):
 
 
 @pytest.fixture
+def grant_cache(redis_client):
+    return GrantCache(redis_client)
+
+
+@pytest.fixture
+def rate_limiter(redis_client):
+    return RateLimiter(redis_client)
+
+
+@pytest.fixture
 def idempotency_store(redis_client, settings):
     return IdempotencyStore(redis_client, settings.idempotency_window_seconds)
 
 
 @pytest.fixture
-def service(settings, session_factory, cipher, idempotency_store, http_client):
+def service(
+    settings, session_factory, cipher, grant_cache, rate_limiter, idempotency_store, http_client
+):
     return InvokeService(
         settings=settings,
         session_factory=session_factory,
         cipher=cipher,
+        grant_cache=grant_cache,
+        rate_limiter=rate_limiter,
         idempotency_store=idempotency_store,
         http_client=http_client,
     )
@@ -145,13 +168,14 @@ async def account(session, cipher):
     return account
 
 
-async def issue_grant(session, settings, agent):
+async def issue_grant(session, settings, agent, grant_cache=None):
     return await request_grant(
         session=session,
         settings=settings,
         agent_id=agent.id,
         tool_name="drive.read",
         requested_scope="read",
+        grant_cache=grant_cache,
     )
 
 
@@ -235,10 +259,10 @@ async def test_expired_grant_row_denied_and_audited(
 
 
 async def test_revoked_grant_denied_and_audited(
-    session, settings, service, fake_google, agent, account
+    session, settings, service, grant_cache, fake_google, agent, account
 ):
-    issued = await issue_grant(session, settings, agent)
-    await revoke_grant(session=session, grant_id=issued.grant.id)
+    issued = await issue_grant(session, settings, agent, grant_cache=grant_cache)
+    await revoke_grant(session=session, grant_id=issued.grant.id, grant_cache=grant_cache)
 
     outcome = await service.invoke(grant_token=issued.token, tool_name="drive.read", arguments={})
 
@@ -248,6 +272,22 @@ async def test_revoked_grant_denied_and_audited(
     assert fake_google.drive_requests == []
     rows = await audit_rows(session)
     assert [r.status for r in rows] == ["denied"]
+
+
+async def test_revoked_in_db_denied_even_on_cache_miss(
+    session, settings, service, fake_google, agent, account
+):
+    # A Redis flush (empty cache) must never resurrect a revoked grant: the
+    # database revoked_at column is the source of truth.
+    issued = await issue_grant(session, settings, agent)
+    await revoke_grant(session=session, grant_id=issued.grant.id, grant_cache=None)
+
+    outcome = await service.invoke(grant_token=issued.token, tool_name="drive.read", arguments={})
+
+    assert outcome.status == "denied"
+    assert "revoked" in outcome.error
+    assert outcome.denied_reason == "revoked"
+    assert fake_google.drive_requests == []
 
 
 async def test_tool_name_mismatch_denied_without_audit(
@@ -305,6 +345,28 @@ async def test_valid_signature_but_unknown_grant_denied_without_audit(
     assert outcome.denied_reason == "not_found"
     assert fake_google.drive_requests == []
     assert await audit_rows(session) == []
+
+
+async def test_rate_limited_denied_and_audited(
+    session, settings, session_factory, cipher, http_client, fake_google, agent, account
+):
+    issued = await issue_grant(session, settings, agent)
+    service = InvokeService(
+        settings=settings,
+        session_factory=session_factory,
+        cipher=cipher,
+        rate_limiter=DenyAllRateLimiter(),
+        http_client=http_client,
+    )
+
+    outcome = await service.invoke(grant_token=issued.token, tool_name="drive.read", arguments={})
+
+    assert outcome.status == "denied"
+    assert "rate limit" in outcome.error
+    assert outcome.denied_reason == "rate_limited"
+    assert fake_google.drive_requests == []
+    rows = await audit_rows(session)
+    assert [r.status for r in rows] == ["denied"]
 
 
 async def test_provider_500_retried_then_failed(
@@ -527,7 +589,7 @@ async def test_idempotency_key_is_isolated_per_connected_account(
     await session.commit()
     # Free the agent's active-grant slot; the idempotency cache entry is
     # keyed by agent + account, not by grant, so it survives the revocation.
-    await revoke_grant(session=session, grant_id=issued_a.grant.id)
+    await revoke_grant(session=session, grant_id=issued_a.grant.id, grant_cache=None)
     issued_b = await issue_grant(session, settings, agent)
     assert issued_b.grant.connected_account_id == account_b.id
 

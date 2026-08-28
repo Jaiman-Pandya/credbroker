@@ -6,15 +6,19 @@ token and a real provider API call, in a fixed order:
 
 1.  Offline verification of the RS256 grant token (signature, issuer, expiry).
 2.  The requested tool must match the tool the token was issued for.
-3.  Revocation and expiry, read from the grant row in the database.
-4.  Tool resolution and grant-scope / tool-scope agreement.
-5.  Idempotency: replay a cached result without touching the provider, or
+3.  Revocation: Redis fast path first, then the database as source of truth
+    (a cache miss is never authoritative), plus the grant row's own expiry.
+4.  Per-agent invoke rate limit.
+5.  Tool resolution and grant-scope / tool-scope agreement.
+6.  Idempotency: replay a cached result without touching the provider, or
     reserve the key for this call.
-6.  Connected-account freshness (refreshing the provider access token when
+7.  Connected-account freshness (refreshing the provider access token when
     it has expired — or is about to — and a refresh token is stored).
-7.  Decryption of the access token, kept in the narrowest possible scope —
+8.  Decryption of the access token, kept in the narrowest possible scope —
     never stored on the service, never logged, never put in an exception.
-8.  The outbound provider call, with retries, backoff, and a per-provider
+9.  A revocation re-check immediately before the outbound call, so a grant
+    revoked mid-flight still aborts the invocation.
+10. The outbound provider call, with retries, backoff, and a per-provider
     circuit breaker — plus at most one credential refresh and retry when the
     provider rejects a token that looked fresh with a 401.
 
@@ -38,6 +42,8 @@ from botocore.exceptions import ClientError
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from credbroker.cache.grants_cache import GrantCache
+from credbroker.cache.ratelimit import RateLimiter
 from credbroker.config import Settings
 from credbroker.crypto.kms import TokenCipher
 from credbroker.db.models import ConnectedAccount, Grant, ensure_aware, utcnow
@@ -74,8 +80,8 @@ class InvokeOutcome:
     success); ``result`` is the provider's JSON-safe payload on success.
     ``denied_reason`` is a machine-readable code set on every denied outcome
     — one of ``invalid_token``, ``expired``, ``revoked``, ``not_found``,
-    ``tool_mismatch``, ``scope_mismatch``, ``idempotency_conflict`` — and
-    None otherwise.
+    ``tool_mismatch``, ``scope_mismatch``, ``rate_limited``,
+    ``idempotency_conflict`` — and None otherwise.
     """
 
     status: str  # "success" | "failed" | "denied"
@@ -93,8 +99,9 @@ def _elapsed_ms(start: float) -> int:
 class InvokeService:
     """Executes tool calls under grant tokens; the sole holder of decrypted credentials.
 
-    All collaborators are injected. The Redis-backed ``idempotency_store``
-    is optional: without it the dedup step is skipped, but every
+    All collaborators are injected. The Redis-backed ones (``grant_cache``,
+    ``rate_limiter``, ``idempotency_store``) are optional: without them the
+    corresponding fast path / throttle / dedup step is skipped, but every
     database-backed security check still runs.
 
     ``http_client`` is likewise optional: when omitted, the service lazily
@@ -109,6 +116,8 @@ class InvokeService:
         settings: Settings,
         session_factory,
         cipher: TokenCipher,
+        grant_cache: GrantCache | None = None,
+        rate_limiter: RateLimiter | None = None,
         idempotency_store: IdempotencyStore | None = None,
         http_client: httpx.AsyncClient | None = None,
         circuits: dict[str, CircuitBreaker] | None = None,
@@ -116,6 +125,8 @@ class InvokeService:
         self._settings = settings
         self._session_factory = session_factory
         self._cipher = cipher
+        self._grant_cache = grant_cache
+        self._rate_limiter = rate_limiter
         self._idempotency_store = idempotency_store
         self._http_client = http_client
         self._owns_http_client = False
@@ -178,6 +189,13 @@ class InvokeService:
 
         token_hash = hash_token(grant_token)
         async with self._session_factory() as session:
+            # Step 3 fast path: a cached revocation marker is safe to act on
+            # directly (it fails closed). A miss proves nothing — the DB
+            # check below remains the source of truth.
+            fast_revoked = self._grant_cache is not None and await self._grant_cache.is_revoked(
+                token_hash
+            )
+
             grant = (
                 await session.execute(select(Grant).where(Grant.grant_token_hash == token_hash))
             ).scalar_one_or_none()
@@ -197,9 +215,11 @@ class InvokeService:
                 outcome = await self._invoke_resolved(
                     session=session,
                     grant=grant,
+                    token_hash=token_hash,
                     tool_name=tool_name,
                     arguments=arguments,
                     idempotency_key=idempotency_key,
+                    fast_revoked=fast_revoked,
                     start=start,
                 )
             except Exception as exc:
@@ -222,7 +242,7 @@ class InvokeService:
                     "failed", error="internal error during tool invocation", start=start
                 )
 
-            # Step 9: exactly one audit row per outcome with a resolved grant.
+            # Step 11: exactly one audit row per outcome with a resolved grant.
             await record_call(
                 session,
                 grant_id=grant_id,
@@ -238,14 +258,16 @@ class InvokeService:
         *,
         session: AsyncSession,
         grant: Grant,
+        token_hash: str,
         tool_name: str,
         arguments: dict,
         idempotency_key: str | None,
+        fast_revoked: bool,
         start: float,
     ) -> InvokeOutcome:
-        """Steps 3 through 8, once a grant row exists to audit against."""
-        # Step 3: revocation and grant expiry, straight from the grant row.
-        if grant.revoked_at is not None:
+        """Steps 3 (continued) through 10, once a grant row exists to audit against."""
+        # Step 3 continued: revocation (cache hit or DB column) and grant expiry.
+        if fast_revoked or grant.revoked_at is not None:
             return self._outcome(
                 "denied", error="grant has been revoked", denied_reason="revoked", start=start
             )
@@ -254,7 +276,20 @@ class InvokeService:
                 "denied", error="grant has expired", denied_reason="expired", start=start
             )
 
-        # Step 4: tool resolution and scope agreement.
+        # Step 4: per-agent invoke rate limit.
+        if self._rate_limiter is not None:
+            allowed = await self._rate_limiter.check(
+                f"invoke:{grant.agent_id}", self._settings.invokes_per_minute_per_agent
+            )
+            if not allowed:
+                return self._outcome(
+                    "denied",
+                    error="invoke rate limit exceeded",
+                    denied_reason="rate_limited",
+                    start=start,
+                )
+
+        # Step 5: tool resolution and scope agreement.
         try:
             tool = get_tool(tool_name)
         except UnknownToolError as exc:
@@ -269,7 +304,7 @@ class InvokeService:
                 start=start,
             )
 
-        # Step 5: idempotency — replay, conflict, or reservation. The key is
+        # Step 6: idempotency — replay, conflict, or reservation. The key is
         # bound to the connected account as well as the agent, so a replay
         # can never serve a result produced against a different account.
         full_key: str | None = None
@@ -304,6 +339,7 @@ class InvokeService:
             outcome = await self._execute_call(
                 session=session,
                 grant=grant,
+                token_hash=token_hash,
                 tool=tool,
                 arguments=arguments,
                 start=start,
@@ -331,17 +367,18 @@ class InvokeService:
         *,
         session: AsyncSession,
         grant: Grant,
+        token_hash: str,
         tool,
         arguments: dict,
         start: float,
     ) -> InvokeOutcome:
-        """Steps 6-8: account freshness, decryption, and the provider call."""
-        # Step 6: load the backing account and refresh its credential if stale.
+        """Steps 7-10: account freshness, decryption, revocation re-check, provider call."""
+        # Step 7: load the backing account and refresh its credential if stale.
         account = await session.get(ConnectedAccount, grant.connected_account_id)
         if account is None:
             return self._outcome("failed", error="connected account no longer exists", start=start)
 
-        # Step 7: the decrypted credential lives only in these locals and the
+        # Step 8: the decrypted credential lives only in these locals and the
         # tool-call closure — never on self, never in a log line, never
         # inside an exception message.
         expires_at = ensure_aware(account.expires_at)
@@ -377,7 +414,15 @@ class InvokeService:
                     "failed", error="stored credential could not be decrypted", start=start
                 )
 
-        # Step 8: the provider call, with retries and the provider's breaker.
+        # Step 9: revocation re-check immediately before the outbound call.
+        # A revocation that landed while this invocation was in flight —
+        # rate-limit round trip, token refresh — must still abort it.
+        if await self._is_revoked_now(session, grant, token_hash):
+            return self._outcome(
+                "denied", error="grant has been revoked", denied_reason="revoked", start=start
+            )
+
+        # Step 10: the provider call, with retries and the provider's breaker.
         # One in-band recovery: a 401 on a credential this call has not
         # already refreshed triggers a single refresh and retry (the token
         # may have been invalidated provider-side); a second 401 fails.
@@ -391,6 +436,15 @@ class InvokeService:
                         return refresh_result
                     access_token = refresh_result
                     refreshed = True
+                    # The refresh took a network round trip; re-check
+                    # revocation before sending the new credential outbound.
+                    if await self._is_revoked_now(session, grant, token_hash):
+                        return self._outcome(
+                            "denied",
+                            error="grant has been revoked",
+                            denied_reason="revoked",
+                            start=start,
+                        )
                     continue
                 # Carries a caller-safe message by construction (status only).
                 return self._outcome("failed", error=str(exc), start=start)
@@ -485,6 +539,27 @@ class InvokeService:
     def _can_refresh(account: ConnectedAccount) -> bool:
         """Whether the account's credential is refreshable (v1 refreshes Google only)."""
         return account.encrypted_refresh_token is not None and account.provider == "google"
+
+    async def _is_revoked_now(
+        self, session: AsyncSession, grant: Grant, token_hash: str
+    ) -> bool:
+        """Fresh revocation check: Redis marker first, then the live DB column.
+
+        Reads ``revoked_at`` straight from the database (not the session's
+        identity map) so a revocation committed by another session or broker
+        instance mid-flight is seen. A vanished row is treated as revoked —
+        this check fails closed.
+        """
+        if self._grant_cache is not None and await self._grant_cache.is_revoked(token_hash):
+            return True
+        row = (
+            await session.execute(
+                select(Grant.id, Grant.revoked_at).where(Grant.id == grant.id)
+            )
+        ).one_or_none()
+        if row is None:
+            return True
+        return row.revoked_at is not None
 
     def _http(self) -> httpx.AsyncClient:
         """Return the HTTP client, lazily creating an owned one when none was injected."""
