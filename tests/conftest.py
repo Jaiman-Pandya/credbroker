@@ -1,8 +1,8 @@
 """Shared test fixtures.
 
-Tests run against SQLite (in-memory) and the local key manager — no external
-services required. All fixtures inject dependencies explicitly; nothing reads
-the real environment.
+Tests run against SQLite (in-memory), fakeredis, and the local key manager —
+no external services required. All fixtures inject dependencies explicitly;
+nothing reads the real environment.
 """
 
 import base64
@@ -50,6 +50,7 @@ def settings(rsa_keypair) -> Settings:
         google_client_id="test-client-id",
         google_client_secret="test-client-secret",
         oauth_state_secret="test-state-secret",
+        outbound_base_delay_seconds=0.001,
         _env_file=None,
     )
 
@@ -76,3 +77,12 @@ def session_factory(engine):
 async def session(session_factory):
     async with session_factory() as s:
         yield s
+
+
+@pytest.fixture
+async def redis_client():
+    import fakeredis.aioredis
+
+    client = fakeredis.aioredis.FakeRedis(decode_responses=True)
+    yield client
+    await client.aclose()
