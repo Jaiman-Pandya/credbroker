@@ -1,0 +1,41 @@
+# Keep the build context minimal: only pyproject.toml, credbroker/, alembic/
+# and alembic.ini are copied into the image (see Dockerfile).
+
+# VCS / local tooling
+.git
+.gitignore
+.dockerignore
+.DS_Store
+
+# Python build/runtime junk
+.venv
+__pycache__
+*.pyc
+*.pyo
+.pytest_cache
+.ruff_cache
+*.egg-info
+dist
+build
+
+# Secrets must never enter the build context.
+.env
+*.pem
+
+# Not needed inside the image
+tests
+docs
+scripts
+infra
+observability
+.github
+Dockerfile
+docker-compose.yml
+Makefile
+.env.example
+
+# Terraform state, if ever run from the repo root
+.terraform
+*.tfstate
+*.tfstate.*
+*.tfvars
