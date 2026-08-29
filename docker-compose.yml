@@ -1,0 +1,74 @@
+# Local development stack for CredBroker.
+#
+#   docker compose up -d
+#
+# Brings up Postgres 16, Redis 7, and the broker (HTTP :8000, gRPC :50051).
+#
+# Secrets are supplied through the environment (or a local .env file, which
+# Compose reads automatically for ${...} substitution). With
+# CREDBROKER_KMS_KEY_ID unset the broker uses the local dev key manager, so
+# no AWS access is required. Raw provider credentials only ever live inside
+# the broker container, envelope-encrypted at rest in Postgres.
+
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: credbroker
+      POSTGRES_PASSWORD: credbroker
+      POSTGRES_DB: credbroker
+    ports:
+      # Exposed for `make run` / psql against localhost during development.
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U credbroker -d credbroker"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7
+    ports:
+      # Exposed for `make run` against localhost during development.
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  broker:
+    build: .
+    # Apply migrations, then start. The image HEALTHCHECK (GET /healthz)
+    # gates readiness. CMD in the Dockerfile stays `python -m credbroker.main`;
+    # the migration step is a compose-only convenience.
+    command: ["sh", "-c", "python -m alembic upgrade head && exec python -m credbroker.main"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      CREDBROKER_DATABASE_URL: postgresql+asyncpg://credbroker:credbroker@postgres:5432/credbroker
+      CREDBROKER_REDIS_URL: redis://redis:6379/0
+      CREDBROKER_PUBLIC_BASE_URL: ${CREDBROKER_PUBLIC_BASE_URL:-http://localhost:8000}
+      # Google OAuth app + CSRF state secret (see .env.example).
+      CREDBROKER_GOOGLE_CLIENT_ID: ${CREDBROKER_GOOGLE_CLIENT_ID:-}
+      CREDBROKER_GOOGLE_CLIENT_SECRET: ${CREDBROKER_GOOGLE_CLIENT_SECRET:-}
+      CREDBROKER_OAUTH_STATE_SECRET: ${CREDBROKER_OAUTH_STATE_SECRET:-dev-state-secret-not-for-production}
+      # Empty KMS key id selects the local key manager (dev only). Provide a
+      # stable base64 32-byte master key or stored credentials become
+      # undecryptable across restarts.
+      CREDBROKER_KMS_KEY_ID: ${CREDBROKER_KMS_KEY_ID:-}
+      CREDBROKER_LOCAL_MASTER_KEY_B64: ${CREDBROKER_LOCAL_MASTER_KEY_B64:-}
+      # RS256 grant-token signing keypair (PEM; see .env.example to generate).
+      CREDBROKER_JWT_PRIVATE_KEY_PEM: ${CREDBROKER_JWT_PRIVATE_KEY_PEM:-}
+      CREDBROKER_JWT_PUBLIC_KEY_PEM: ${CREDBROKER_JWT_PUBLIC_KEY_PEM:-}
+    ports:
+      - "8000:8000"   # HTTP: OAuth flow, /healthz
+      - "50051:50051" # gRPC: RequestGrant / InvokeTool / RevokeGrant
+
+volumes:
+  pgdata:

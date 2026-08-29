@@ -1,6 +1,6 @@
 PYTHON ?= .venv/bin/python
 
-.PHONY: install test lint proto migrate
+.PHONY: install test lint proto run migrate docker-build up down
 
 install:
 	python3 -m venv .venv
@@ -16,5 +16,17 @@ lint:
 proto:
 	bash scripts/gen_proto.sh
 
+run:
+	$(PYTHON) -m credbroker.main
+
 migrate:
 	$(PYTHON) -m alembic upgrade head
+
+docker-build:
+	docker build -t credbroker:local .
+
+up:
+	docker compose up -d
+
+down:
+	docker compose down
