@@ -3,6 +3,7 @@
 #   docker compose up -d
 #
 # Brings up Postgres 16, Redis 7, the broker (HTTP :8000, gRPC :50051),
+# a fake Google Drive API (internal :9100, no credentials needed),
 # Prometheus (:9090) and Grafana (:3000, admin/admin — dev only).
 #
 # Secrets are supplied through the environment (or a local .env file, which
@@ -20,7 +21,8 @@ services:
       POSTGRES_DB: credbroker
     ports:
       # Exposed for `make run` / psql against localhost during development.
-      - "5432:5432"
+      # Host port 5433 avoids clashing with a local Postgres on 5432.
+      - "5433:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
@@ -40,6 +42,19 @@ services:
       timeout: 3s
       retries: 10
 
+  fake-drive:
+    # Stand-in for the Google Drive API so the full grant -> invoke -> audit
+    # loop runs locally with zero Google credentials. Reachable only on the
+    # compose network (no host port); only the broker talks to it.
+    build: .
+    command: ["python", "-m", "credbroker.demo.fake_drive"]
+    healthcheck:
+      # Override the image HEALTHCHECK (which probes the broker's :8000).
+      test: ["CMD", "python", "-c", "import urllib.request, sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:9100/healthz', timeout=4).status == 200 else 1)"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
   broker:
     build: .
     # Apply migrations, then start. The image HEALTHCHECK (GET /healthz)
@@ -51,9 +66,14 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+      fake-drive:
+        condition: service_healthy
     environment:
       CREDBROKER_DATABASE_URL: postgresql+asyncpg://credbroker:credbroker@postgres:5432/credbroker
       CREDBROKER_REDIS_URL: redis://redis:6379/0
+      # Point drive.read at the fake Drive service so the demo needs no Google
+      # credentials. Remove this line to call the real Google Drive API.
+      CREDBROKER_DRIVE_API_BASE_URL: http://fake-drive:9100
       CREDBROKER_PUBLIC_BASE_URL: ${CREDBROKER_PUBLIC_BASE_URL:-http://localhost:8000}
       # Google OAuth app + CSRF state secret (see .env.example).
       CREDBROKER_GOOGLE_CLIENT_ID: ${CREDBROKER_GOOGLE_CLIENT_ID:-}
