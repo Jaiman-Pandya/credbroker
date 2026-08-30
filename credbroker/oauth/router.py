@@ -19,6 +19,7 @@ from datetime import timedelta
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import RedirectResponse
 
+from credbroker import metrics
 from credbroker.db.models import ConnectedAccount, utcnow
 from credbroker.errors import OAuthFlowError
 from credbroker.oauth import google
@@ -114,6 +115,7 @@ async def callback(
         account_id = account.id
         await session.commit()
 
+    metrics.OAUTH_ACCOUNTS_CONNECTED.labels(provider=_PROVIDER).inc()
     logger.info("connected %s account %s for user %s", _PROVIDER, account_id, user_id)
     return {
         "connected_account_id": str(account_id),

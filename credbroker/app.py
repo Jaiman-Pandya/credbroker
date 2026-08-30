@@ -1,13 +1,15 @@
 """FastAPI application factory.
 
 The HTTP surface is intentionally tiny: OAuth connect flow (browsers need
-HTTP redirects) and a health check. Everything agent-facing will speak gRPC.
+HTTP redirects), health check, and Prometheus metrics. Everything agent-facing
+is gRPC — see credbroker.grpcserver.
 """
 
 from contextlib import asynccontextmanager
 
 import httpx
 from fastapi import FastAPI
+from prometheus_client import make_asgi_app
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from credbroker import __version__
@@ -43,5 +45,7 @@ def create_app(
     @app.get("/healthz")
     async def healthz() -> dict:
         return {"status": "ok", "version": __version__}
+
+    app.mount("/metrics", make_asgi_app())
 
     return app

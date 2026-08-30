@@ -21,6 +21,7 @@ from datetime import timedelta
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from credbroker import metrics
 from credbroker.config import Settings
 from credbroker.db.models import AgentIdentity, ConnectedAccount, Grant, utcnow
 from credbroker.errors import (
@@ -72,6 +73,7 @@ async def request_grant(
             f"grants:{agent_id}", settings.grants_per_minute_per_agent
         )
         if not allowed:
+            metrics.RATE_LIMITED.labels(operation="request_grant").inc()
             raise RateLimitedError("grant request rate limit exceeded")
 
     # Row lock on the agent serializes concurrent requests for the same agent

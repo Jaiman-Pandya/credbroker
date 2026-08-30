@@ -14,6 +14,7 @@ import httpx
 import pytest
 from sqlalchemy import select, update
 
+from credbroker import metrics
 from credbroker.cache.grants_cache import GrantCache
 from credbroker.cache.ratelimit import RateLimiter
 from credbroker.crypto.kms import build_token_cipher
@@ -358,12 +359,15 @@ async def test_rate_limited_denied_and_audited(
         rate_limiter=DenyAllRateLimiter(),
         http_client=http_client,
     )
+    counter = metrics.RATE_LIMITED.labels(operation="invoke_tool")
+    before = counter._value.get()
 
     outcome = await service.invoke(grant_token=issued.token, tool_name="drive.read", arguments={})
 
     assert outcome.status == "denied"
     assert "rate limit" in outcome.error
     assert outcome.denied_reason == "rate_limited"
+    assert counter._value.get() == before + 1
     assert fake_google.drive_requests == []
     rows = await audit_rows(session)
     assert [r.status for r in rows] == ["denied"]

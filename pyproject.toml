@@ -20,6 +20,7 @@ dependencies = [
     "grpcio>=1.66",
     "protobuf>=5.26",
     "redis>=5.0",
+    "prometheus-client>=0.20",
 ]
 
 [project.optional-dependencies]

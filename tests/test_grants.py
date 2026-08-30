@@ -10,6 +10,7 @@ from datetime import timedelta
 import pytest
 from sqlalchemy import select, update
 
+from credbroker import metrics
 from credbroker.db.models import AgentIdentity, ConnectedAccount, Grant, utcnow
 from credbroker.errors import (
     ConcurrencyLimitError,
@@ -293,6 +294,8 @@ async def test_revoked_grant_does_not_count_toward_limit(session, settings, agen
 
 async def test_rate_limited(session, settings, agent, account):
     limiter = FakeRateLimiter(allow=False)
+    counter = metrics.RATE_LIMITED.labels(operation="request_grant")
+    before = counter._value.get()
 
     with pytest.raises(RateLimitedError):
         await request_grant(
@@ -304,6 +307,7 @@ async def test_rate_limited(session, settings, agent, account):
             rate_limiter=limiter,
         )
 
+    assert counter._value.get() == before + 1
     # Rate limiting runs before any DB work: no grant row must exist.
     assert (await session.execute(select(Grant))).scalars().all() == []
 

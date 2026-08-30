@@ -18,7 +18,7 @@ import jwt as pyjwt
 import pytest
 from google.protobuf import json_format, struct_pb2
 
-from credbroker import logging_config
+from credbroker import logging_config, metrics
 from credbroker.cache.grants_cache import GrantCache
 from credbroker.cache.ratelimit import RateLimiter
 from credbroker.db.models import AgentIdentity, ConnectedAccount, Grant, utcnow
@@ -103,6 +103,10 @@ def denied_outcome(error: str, denied_reason: str, latency_ms: int = 3) -> Simpl
     )
 
 
+def counter_value(counter, **labels) -> float:
+    return counter.labels(**labels)._value.get()
+
+
 @pytest.fixture
 async def agent(session) -> AgentIdentity:
     agent = AgentIdentity(user_id=USER_ID, name="test-agent", allowed_scopes=[TOOL_NAME])
@@ -159,6 +163,8 @@ def grant_request(agent_id: str) -> credbroker_pb2.GrantRequest:
 
 
 async def test_request_grant_happy_path(servicer, settings, agent, account):
+    before = counter_value(metrics.GRANTS_ISSUED, tool_name=TOOL_NAME, scope=TOOL_SCOPE)
+
     response = await servicer.RequestGrant(grant_request(str(agent.id)), FakeContext())
 
     assert response.grant_token
@@ -178,6 +184,8 @@ async def test_request_grant_happy_path(servicer, settings, agent, account):
     assert claims.scope == TOOL_SCOPE
 
     assert response.expires_at.ToDatetime(tzinfo=UTC) > utcnow()
+    after = counter_value(metrics.GRANTS_ISSUED, tool_name=TOOL_NAME, scope=TOOL_SCOPE)
+    assert after == before + 1
 
 
 async def test_request_grant_never_returns_raw_credentials(servicer, agent, account):
@@ -217,11 +225,13 @@ async def test_request_grant_policy_denied(servicer, session, account):
     agent = AgentIdentity(user_id=USER_ID, name="unprivileged", allowed_scopes=[])
     session.add(agent)
     await session.commit()
+    before = counter_value(metrics.GRANT_DENIALS, reason="PolicyDeniedError")
 
     with pytest.raises(AbortSentinel) as excinfo:
         await servicer.RequestGrant(grant_request(str(agent.id)), FakeContext())
 
     assert excinfo.value.code == grpc.StatusCode.PERMISSION_DENIED
+    assert counter_value(metrics.GRANT_DENIALS, reason="PolicyDeniedError") == before + 1
 
 
 async def test_request_grant_scope_mismatch(servicer, agent, account):
@@ -259,6 +269,7 @@ def invoke_request(arguments: dict, **kwargs) -> credbroker_pb2.InvokeRequest:
 async def test_invoke_success_returns_struct_result(servicer, stub_invoke):
     result = {"files": [{"id": "f1", "name": "Design doc"}], "nextPageToken": "tok"}
     stub_invoke.outcome = success_outcome(result)
+    before = counter_value(metrics.INVOCATIONS, tool_name=TOOL_NAME, status="success")
 
     response = await servicer.InvokeTool(
         invoke_request({"query": "name contains 'doc'"}), FakeContext()
@@ -266,6 +277,7 @@ async def test_invoke_success_returns_struct_result(servicer, stub_invoke):
 
     assert response.status == "success"
     assert json_format.MessageToDict(response.result) == result
+    assert counter_value(metrics.INVOCATIONS, tool_name=TOOL_NAME, status="success") == before + 1
     # Arguments crossed the boundary as a plain dict; empty key became None.
     assert stub_invoke.calls == [
         {
@@ -286,12 +298,14 @@ async def test_invoke_passes_idempotency_key(servicer, stub_invoke):
 
 async def test_invoke_denied_maps_to_permission_denied(servicer, stub_invoke):
     stub_invoke.outcome = denied_outcome("grant is revoked", "revoked")
+    before = counter_value(metrics.INVOCATIONS, tool_name=TOOL_NAME, status="denied")
 
     with pytest.raises(AbortSentinel) as excinfo:
         await servicer.InvokeTool(invoke_request({}), FakeContext())
 
     assert excinfo.value.code == grpc.StatusCode.PERMISSION_DENIED
     assert excinfo.value.details == "grant is revoked"
+    assert counter_value(metrics.INVOCATIONS, tool_name=TOOL_NAME, status="denied") == before + 1
 
 
 async def test_invoke_rate_limited_maps_to_resource_exhausted(servicer, stub_invoke):
@@ -316,6 +330,29 @@ async def test_invoke_failed_maps_to_unavailable(servicer, stub_invoke):
         await servicer.InvokeTool(invoke_request({}), FakeContext())
     assert excinfo.value.code == grpc.StatusCode.UNAVAILABLE
     assert excinfo.value.details == "provider unavailable"
+
+
+async def test_invoke_unregistered_tool_labels_metrics_unknown(servicer, stub_invoke):
+    """A caller-invented tool name must not mint a new /metrics label value."""
+    rogue = f"rogue.tool.{uuid.uuid4().hex}"
+    before = counter_value(metrics.INVOCATIONS, tool_name="unknown", status="success")
+
+    request = credbroker_pb2.InvokeRequest(
+        grant_token="grant-token", tool_name=rogue, arguments=struct_pb2.Struct()
+    )
+    await servicer.InvokeTool(request, FakeContext())
+
+    assert counter_value(metrics.INVOCATIONS, tool_name="unknown", status="success") == before + 1
+    labeled = {
+        sample.labels.get("tool_name")
+        for metric in (metrics.INVOCATIONS, metrics.INVOKE_LATENCY)
+        for family in metric.collect()
+        for sample in family.samples
+    }
+    assert rogue not in labeled
+    assert "unknown" in labeled
+    # The raw name still reaches the invoke service, whose checks deny it.
+    assert stub_invoke.calls[0]["tool_name"] == rogue
 
 
 class RaisingInvokeService:

@@ -42,6 +42,7 @@ from botocore.exceptions import ClientError
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from credbroker import metrics
 from credbroker.cache.grants_cache import GrantCache
 from credbroker.cache.ratelimit import RateLimiter
 from credbroker.config import Settings
@@ -282,6 +283,7 @@ class InvokeService:
                 f"invoke:{grant.agent_id}", self._settings.invokes_per_minute_per_agent
             )
             if not allowed:
+                metrics.RATE_LIMITED.labels(operation="invoke_tool").inc()
                 return self._outcome(
                     "denied",
                     error="invoke rate limit exceeded",
