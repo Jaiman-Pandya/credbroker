@@ -1,0 +1,21 @@
+# Prometheus configuration for the CredBroker docker-compose stack.
+#
+# The broker exposes prometheus_client metrics on its HTTP port (8000) at
+# /metrics; "broker" is the compose service name. Metric values are counters,
+# histograms, and labels only — never credentials or grant tokens — so scraping
+# them is safe by construction.
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: credbroker
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["broker:8000"]
+
+  # Prometheus self-monitoring (scrape health, TSDB stats).
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]

@@ -1,0 +1,17 @@
+# Grafana datasource provisioning: the compose-stack Prometheus instance.
+#
+# The uid is pinned so dashboards can reference the datasource by a stable id
+# instead of relying on "default" resolution.
+
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    uid: credbroker-prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: false
+    jsonData:
+      timeInterval: 15s

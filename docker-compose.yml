@@ -2,7 +2,8 @@
 #
 #   docker compose up -d
 #
-# Brings up Postgres 16, Redis 7, and the broker (HTTP :8000, gRPC :50051).
+# Brings up Postgres 16, Redis 7, the broker (HTTP :8000, gRPC :50051),
+# Prometheus (:9090) and Grafana (:3000, admin/admin — dev only).
 #
 # Secrets are supplied through the environment (or a local .env file, which
 # Compose reads automatically for ${...} substitution). With
@@ -67,8 +68,34 @@ services:
       CREDBROKER_JWT_PRIVATE_KEY_PEM: ${CREDBROKER_JWT_PRIVATE_KEY_PEM:-}
       CREDBROKER_JWT_PUBLIC_KEY_PEM: ${CREDBROKER_JWT_PUBLIC_KEY_PEM:-}
     ports:
-      - "8000:8000"   # HTTP: OAuth flow, /healthz
+      - "8000:8000"   # HTTP: OAuth flow, /healthz, /metrics
       - "50051:50051" # gRPC: RequestGrant / InvokeTool / RevokeGrant
+
+  prometheus:
+    image: prom/prometheus
+    depends_on:
+      - broker
+    volumes:
+      # Scrapes broker:8000/metrics (see observability/prometheus.yml).
+      - ./observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9090:9090"
+
+  grafana:
+    image: grafana/grafana
+    depends_on:
+      - prometheus
+    environment:
+      # Dev-only credentials; never reuse for a shared deployment.
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+    volumes:
+      # Datasource + dashboard provisioning; the dashboards provider points at
+      # /var/lib/grafana/dashboards.
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports:
+      - "3000:3000"
 
 volumes:
   pgdata:
