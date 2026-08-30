@@ -8,6 +8,8 @@ import grpc
 import httpx
 import redis.asyncio as aioredis
 import uvicorn
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
 
 from credbroker.app import create_app
 from credbroker.config import Settings, get_settings
@@ -15,10 +17,48 @@ from credbroker.crypto.kms import build_token_cipher
 from credbroker.db.session import create_engine, create_session_factory
 from credbroker.grpcserver.server import build_grpc_server
 from credbroker.logging_config import configure_logging
+from credbroker.tools import configure_tools
 
 logger = logging.getLogger(__name__)
 
 _SHUTDOWN_GRACE_SECONDS = 5
+
+
+def ensure_dev_jwt_keys(settings: Settings) -> Settings:
+    """Return settings guaranteed to carry a JWT grant-signing keypair.
+
+    A configured keypair passes through untouched. When no private key is
+    set, generate an ephemeral RSA keypair so a fresh checkout can issue
+    grants with zero key setup — dev ergonomics only: the keys exist in this
+    process alone, so every outstanding grant token dies with a restart.
+    Production must always configure CREDBROKER_JWT_PRIVATE_KEY_PEM.
+    """
+    if settings.jwt_private_key_pem:
+        return settings
+    logger.warning(
+        "CREDBROKER_JWT_PRIVATE_KEY_PEM is not set; generating an ephemeral "
+        "RSA keypair for grant signing. Grants will NOT survive a restart — "
+        "this is for development only, never run production this way."
+    )
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    private_pem = key.private_bytes(
+        serialization.Encoding.PEM,
+        serialization.PrivateFormat.PKCS8,
+        serialization.NoEncryption(),
+    ).decode()
+    public_pem = (
+        key.public_key()
+        .public_bytes(
+            serialization.Encoding.PEM,
+            serialization.PublicFormat.SubjectPublicKeyInfo,
+        )
+        .decode()
+    )
+    # model_copy (not mutation) so the generated PEMs flow to every consumer
+    # of this Settings instance without touching get_settings()'s cached one.
+    return settings.model_copy(
+        update={"jwt_private_key_pem": private_pem, "jwt_public_key_pem": public_pem}
+    )
 
 
 def build_servers(
@@ -34,13 +74,16 @@ def build_servers(
     Split out of ``serve()`` so the wiring is testable without binding
     sockets or touching real backends. The same ``http_client`` must reach
     both servers: the OAuth flow and outbound tool invocations share its
-    connection pool, and ``serve()`` owns its lifetime.
+    connection pool, and ``serve()`` owns its lifetime. The same goes for
+    ``redis_client``: the console's invoke path and the gRPC one must see
+    the same revocation cache, rate limits, and idempotency keys.
     """
     app = create_app(
         settings=settings,
         session_factory=session_factory,
         cipher=cipher,
         http_client=http_client,
+        redis_client=redis_client,
     )
     # log_config=None keeps uvicorn's loggers propagating to root, where the
     # secret-redaction filter lives (uvicorn's default config attaches its
@@ -91,7 +134,8 @@ def install_signal_handlers(http_server: uvicorn.Server, grpc_server) -> None:
 
 async def serve() -> None:
     configure_logging()
-    settings = get_settings()
+    settings = ensure_dev_jwt_keys(get_settings())
+    configure_tools(settings)
 
     engine = create_engine(settings.database_url)
     session_factory = create_session_factory(engine)

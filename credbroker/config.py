@@ -53,6 +53,8 @@ class Settings(BaseSettings):
     # Provider tool APIs (point at a local fake for credential-free demos)
     drive_api_base_url: str = "https://www.googleapis.com/drive/v3"
 
+    # Operator console (empty token leaves the console open — dev only)
+    console_token: str = ""
 
 
 @lru_cache
