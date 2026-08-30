@@ -1,0 +1,209 @@
+# CredBroker CI/CD.
+#
+# PRs and pushes to main run lint, tests, a Docker build, and static Terraform
+# checks. Pushes to main additionally push the image to ECR and, once the
+# TERRAFORM_ENABLED repository variable is set, run the Terraform plan/apply
+# pipeline.
+#
+# Deploy jobs authenticate to AWS with GitHub OIDC (no long-lived keys) and the
+# Terraform apply is gated behind the "production" environment, so a required
+# reviewer (configured in repo settings) must approve before infrastructure
+# changes land.
+#
+# Required repository variables (Settings -> Secrets and variables -> Actions):
+#   AWS_OIDC_ROLE_ARN  IAM role assumable via GitHub OIDC (ECR push + Terraform)
+#   AWS_REGION         e.g. us-east-1
+#   ECR_REPOSITORY     ECR repository name, e.g. credbroker
+#   TERRAFORM_ENABLED  set to "true" to enable the Terraform plan/apply jobs on
+#                      main. Configure the S3 backend in
+#                      infra/terraform/providers.tf FIRST: with the backend
+#                      commented out every runner starts from fresh local state
+#                      and a second push to main would try to recreate the
+#                      whole stack.
+# No secret values flow through Terraform or this workflow: the OAuth client
+# and JWT signing keys are seeded directly into Secrets Manager out-of-band
+# (see infra/terraform/secrets.tf).
+
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# Default to read-only; jobs that need OIDC opt in to id-token: write.
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  lint:
+    name: Lint (ruff)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4.2.2
+      - uses: actions/setup-python@v5.3.0
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - name: Install package with dev extras
+        run: python -m pip install -e ".[dev]"
+      - name: Ruff
+        run: python -m ruff check credbroker tests
+
+  test:
+    name: Test (pytest)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4.2.2
+      - uses: actions/setup-python@v5.3.0
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - name: Install package with dev extras
+        run: python -m pip install -e ".[dev]"
+      - name: Pytest
+        run: python -m pytest -q
+
+  docker-build:
+    name: Docker build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4.2.2
+      - uses: docker/setup-buildx-action@v3.7.1
+      - name: Build image (no push)
+        uses: docker/build-push-action@v6.9.0
+        with:
+          context: .
+          push: false
+          tags: credbroker:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  push-ecr:
+    name: Push image to ECR
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [lint, test, docker-build]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4.2.2
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4.0.2
+        with:
+          role-to-assume: ${{ vars.AWS_OIDC_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+      - name: Log in to ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2.0.1
+        with:
+          mask-password: "true"
+      - uses: docker/setup-buildx-action@v3.7.1
+      - name: Build and push
+        uses: docker/build-push-action@v6.9.0
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ steps.ecr-login.outputs.registry }}/${{ vars.ECR_REPOSITORY }}:${{ github.sha }}
+            ${{ steps.ecr-login.outputs.registry }}/${{ vars.ECR_REPOSITORY }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # PR-time static checks only: no backend, no AWS credentials.
+  terraform-check:
+    name: Terraform check
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: infra/terraform
+    steps:
+      - uses: actions/checkout@v4.2.2
+      - uses: hashicorp/setup-terraform@v3.1.2
+        with:
+          terraform_version: 1.9.8
+      - name: Terraform fmt check
+        run: terraform fmt -check -recursive
+      - name: Terraform init (no backend)
+        run: terraform init -backend=false -input=false
+      - name: Terraform validate
+        run: terraform validate -no-color
+
+  terraform-plan:
+    name: Terraform plan
+    # TERRAFORM_ENABLED must stay unset until the S3 backend in
+    # infra/terraform/providers.tf is configured (see header comment).
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && vars.TERRAFORM_ENABLED == 'true'
+    needs: [lint, test]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write
+    defaults:
+      run:
+        working-directory: infra/terraform
+    env:
+      TF_IN_AUTOMATION: "true"
+      # OAuth client and JWT keys are seeded into Secrets Manager out-of-band
+      # (see infra/terraform/secrets.tf); Terraform never carries secret values.
+      TF_VAR_container_image_tag: ${{ github.sha }}
+    steps:
+      - uses: actions/checkout@v4.2.2
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4.0.2
+        with:
+          role-to-assume: ${{ vars.AWS_OIDC_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+      - uses: hashicorp/setup-terraform@v3.1.2
+        with:
+          terraform_version: 1.9.8
+      - name: Terraform fmt check
+        run: terraform fmt -check -recursive
+      - name: Terraform init
+        run: terraform init -input=false
+      - name: Terraform validate
+        run: terraform validate -no-color
+      - name: Terraform plan
+        run: terraform plan -input=false -no-color
+
+  terraform-apply:
+    name: Terraform apply
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && vars.TERRAFORM_ENABLED == 'true'
+    needs: [terraform-plan, push-ecr]
+    runs-on: ubuntu-24.04
+    # Manual-approval gate: configure required reviewers on this environment.
+    environment: production
+    permissions:
+      contents: read
+      id-token: write
+    defaults:
+      run:
+        working-directory: infra/terraform
+    env:
+      TF_IN_AUTOMATION: "true"
+      TF_VAR_container_image_tag: ${{ github.sha }}
+    steps:
+      - uses: actions/checkout@v4.2.2
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4.0.2
+        with:
+          role-to-assume: ${{ vars.AWS_OIDC_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+      - uses: hashicorp/setup-terraform@v3.1.2
+        with:
+          terraform_version: 1.9.8
+      - name: Terraform init
+        run: terraform init -input=false
+      # Re-plan and apply inside the approved job rather than shipping the plan
+      # file between jobs: a saved plan can embed sensitive variable values, and
+      # workflow artifacts are readable by anyone with read access to the repo.
+      - name: Terraform apply
+        run: terraform apply -input=false -auto-approve -no-color
