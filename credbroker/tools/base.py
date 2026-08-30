@@ -9,6 +9,7 @@ import abc
 
 import httpx
 
+from credbroker.config import Settings
 from credbroker.errors import UnknownToolError
 
 
@@ -19,6 +20,17 @@ class ToolAdapter(abc.ABC):
     provider: str  # connected-account provider, e.g. "google"
     scope: str  # action class: "read" or "write"
     side_effectful: bool  # True if the call mutates provider state
+
+    # Deliberately a concrete no-op, not @abstractmethod: most adapters need
+    # no configuration and must not be forced to override it.
+    def configure(self, settings: Settings) -> None:  # noqa: B027
+        """Apply settings to this adapter; a no-op by default.
+
+        Called once at process startup (see
+        :func:`credbroker.tools.configure_tools`). Adapters whose endpoint is
+        configurable override this; an unconfigured adapter must behave
+        exactly as it did before this hook existed.
+        """
 
     @abc.abstractmethod
     async def call(

@@ -50,6 +50,10 @@ class Settings(BaseSettings):
     grants_per_minute_per_agent: int = 60
     invokes_per_minute_per_agent: int = 120
 
+    # Provider tool APIs (point at a local fake for credential-free demos)
+    drive_api_base_url: str = "https://www.googleapis.com/drive/v3"
+
+
 
 @lru_cache
 def get_settings() -> Settings:

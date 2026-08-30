@@ -2,10 +2,11 @@
 
 import httpx
 
+from credbroker.config import Settings
 from credbroker.errors import ProviderCallError
 from credbroker.tools.base import ToolAdapter
 
-DRIVE_FILES_URL = "https://www.googleapis.com/drive/v3/files"
+DRIVE_API_DEFAULT = "https://www.googleapis.com/drive/v3"
 
 
 class DriveListFilesTool(ToolAdapter):
@@ -15,6 +16,14 @@ class DriveListFilesTool(ToolAdapter):
     provider = "google"
     scope = "read"
     side_effectful = False
+
+    # Class-level default so an unconfigured instance targets the real API.
+    _base_url = DRIVE_API_DEFAULT
+
+    def configure(self, settings: Settings) -> None:
+        # Overridable so local demos can point at the fake Drive service
+        # (credbroker.demo.fake_drive) instead of Google.
+        self._base_url = settings.drive_api_base_url or DRIVE_API_DEFAULT
 
     async def call(
         self, access_token: str, arguments: dict, http_client: httpx.AsyncClient
@@ -29,7 +38,7 @@ class DriveListFilesTool(ToolAdapter):
             params["pageToken"] = str(page_token)
 
         response = await http_client.get(
-            DRIVE_FILES_URL,
+            f"{self._base_url}/files",
             params=params,
             headers={"Authorization": f"Bearer {access_token}"},
         )
