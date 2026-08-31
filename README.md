@@ -10,6 +10,9 @@ AI agents act through tools that call real services such as Google Drive or Slac
 
 CredBroker keeps every credential inside one service. An agent that wants to act must first ask the broker for a grant. A grant is a signed pass that expires after five minutes and authorizes one class of action. The agent presents the pass when it wants the action performed. The broker validates the pass. It then decrypts the real credential inside its own process and calls the provider. Only the result leaves the broker. Every issuance and every call lands in an audit log. A grant can be revoked at any moment. Revocation reaches calls that are already in flight.
 
+## System Architecture
+<img width="1983" height="918" alt="architecture" src="https://github.com/user-attachments/assets/ccd89b74-ba1e-4923-bea8-4dffed64cbbf" />
+
 ## How a Call Flows
 
 1. A user connects a Google account through a standard OAuth consent screen.
