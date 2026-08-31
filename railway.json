@@ -1,8 +1,0 @@
-{
-  "$schema": "https://railway.com/railway.schema.json",
-  "deploy": {
-    "startCommand": "python -m alembic upgrade head && exec python -m credbroker.main",
-    "restartPolicyType": "ON_FAILURE",
-    "restartPolicyMaxRetries": 5
-  }
-}
