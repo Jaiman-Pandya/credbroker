@@ -100,6 +100,8 @@ The Terraform under infra/terraform provisions the production stack on AWS. It c
 
 GitHub Actions runs lint and tests and an image build on every change. Pushes to main also publish the image to ECR. The Terraform jobs stay inert until the TERRAFORM_ENABLED repository variable is set. Configure the state backend first. Secrets never pass through Terraform or the pipeline. They are seeded directly into Secrets Manager.
 
+The railway.json at the repository root also lets the same container run on Railway. It applies migrations on boot. A hosted demo instance runs the bundled fake Drive so the console works there without any Google credentials.
+
 ## Observability
 
 The broker exposes Prometheus metrics at /metrics. They cover grant issuance and denials and invoke latency and failures and revocations and rate limiting. The demo stack provisions a Grafana dashboard on port 3000.
